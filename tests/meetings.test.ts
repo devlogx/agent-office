@@ -59,7 +59,8 @@ function fixture(opts: { git?: boolean; rewritten?: Partial<Record<PromptId, str
       return {};
     },
   };
-  const room: MeetingRoom = new MeetingRoom(dir, dataDir, manager, opts.git ? new Worktrees(dir) : undefined, {
+  const trees = opts.git ? new Worktrees(dir) : undefined;
+  const room: MeetingRoom = new MeetingRoom(dir, dataDir, manager, { home: (checkout) => (checkout ? `${checkout} isn't on this floor any more` : { name: 'demo', dir, trees, ref: (wt) => wt }) }, {
     update() {},
     toast: (text) => toasts.push(text),
     hiringPaused: () => undefined,

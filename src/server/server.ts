@@ -1957,8 +1957,10 @@ export async function startServer(cfg: Config) {
           provider: msg.provider,
           model: msg.model === undefined ? undefined : str(msg.model, OPEN_CODE_MODEL_MAX + 1),
           effort: isAgentEffort(msg.effort) ? msg.effort : undefined,
+          checkout: str(msg.checkout, 40) || undefined,
         };
-        withSignIn(c, claudeFor(request.provider ?? floor.workers.officeDefault.provider), () => withFreshBase(c, floor, () => warn(c, floor.meetings.start(request, who, c.accountId))));
+        // Its worktree is cut from the checkout it works in: that one's branch is fetched first.
+        withSignIn(c, claudeFor(request.provider ?? floor.workers.officeDefault.provider), () => withFreshBase(c, floor, () => warn(c, floor.meetings.start(request, who, c.accountId)), [request.checkout]));
         break;
       }
       case 'meeting.stop': {

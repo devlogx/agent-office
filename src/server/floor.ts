@@ -20,7 +20,6 @@ import { Court } from './court.js';
 import { Jukebox } from './jukebox.js';
 import { Whiteboard } from './whiteboard.js';
 import { MeetingRoom } from './meetings.js';
-import { Worktrees } from './worktrees.js';
 import { landedWorkers } from './leave-on-merge.js';
 import type { Ledger } from './usage.js';
 import type { Capacity } from './machine.js';
@@ -175,8 +174,9 @@ export function projectInfo(dir: string, name: string, agentCmd: string, agentAr
  * One floor of the building: a project's checkout with its own desks and workers, issues and PR
  * boards, task queue, pictures and jukebox, all kept in that checkout's .agent-office folder. Other
  * repositories' checkouts can be linked to it (see FloorLink): workers are hired in those too, and
- * their issues and pull requests are on the boards with the floor's own. The task queue, the meeting
- * room and the board agents work in the floor's own checkout.
+ * their issues and pull requests are on the boards with the floor's own. A meeting works in whichever
+ * of them it's called in (see Meeting.checkout); the task queue and the board agents work in the
+ * floor's own checkout.
  */
 export class Floor {
   readonly id: string;
@@ -306,19 +306,30 @@ export class Floor {
           return workers.officeDefault;
         },
         list: () => this.workers.list(),
-        seat: (deskId, by, prompt, provider, model, effort, meeting, owner) => this.workers.spawn(deskId, by, prompt, false, 'agent', provider, model, effort, meeting, owner),
+        seat: (deskId, by, prompt, provider, model, effort, { checkout, ...meeting }, owner) => this.workers.spawn(deskId, by, prompt, false, 'agent', provider, model, effort, meeting, owner, [], checkout),
         prompt: (id, text, by) => this.workers.prompt(id, text, by),
         write: (id, data, by) => this.workers.write(id, data, by),
         kill: (id) => this.workers.kill(id),
       },
-      this.project.branch ? new Worktrees(def.dir) : undefined,
+      {
+        // As a worker's (see WorkerManager.checkoutHome), with worktrees only in a checkout on a branch.
+        home: (checkout, at) => {
+          const h = this.workers.checkoutHome(checkout, at);
+          if (typeof h === 'string') return h;
+          const git = h.link ? !!this.linkInfo.find((l) => l.id === h.link!.id)?.branch : !!this.project.branch;
+          return { checkout: h.link?.id, name: h.link?.name ?? def.name, dir: h.dir, at: h.at, trees: git ? h.trees : undefined, ref: h.ref };
+        },
+      },
       {
         update: (state) => ctx.emit(this, { t: 'meeting', state }),
         toast: (text, level) => ctx.toast(this, text, level),
         hiringPaused: () => ctx.ledger.hiringPaused,
-        postReview: (pr, file, owner) => {
+        postReview: (pr, file, owner, checkout) => {
           const as = ctx.ghAs(owner);
-          return typeof as === 'string' ? Promise.reject(new Error(as)) : this.github.review(pr, file, as);
+          if (typeof as === 'string') return Promise.reject(new Error(as));
+          // On the pull request of the repository the meeting worked in: numbers are only unique within one.
+          const gh = this.boardOf(checkout);
+          return gh ? gh.review(pr, file, as) : Promise.reject(new Error(`${checkout} isn't on this floor any more`));
         },
         prompt: (id) => ctx.prompts.text(id),
       },

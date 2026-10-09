@@ -126,7 +126,7 @@ export interface LinkedCheckout {
 }
 
 /** A checkout a worker works in, git plumbing for it, and a worktree of the worker's in its terms (see home). */
-interface Home {
+export interface Home {
   dir: string;
   trees: Worktrees;
   /** A worktree whose path is relative to the floor's dir, where it lives, with that path relative to this checkout instead. */
@@ -509,6 +509,21 @@ export class WorkerManager {
     return { dir: link.dir, trees, ref: (wt) => (wt.path ? { ...wt, path: path.relative(link.dir, path.join(this.dir, wt.path)) } : wt) };
   }
 
+  /**
+   * The checkout a meeting works in (Meeting.checkout), as home() has it for a worker: the floor's own
+   * without `checkout`, or a linked one, with the git plumbing its workers use. `at` is the repository
+   * it was when the meeting was called (see Worker.checkoutAt): it's found while the floor has it, under
+   * that id or linked again under another (`link` says which); otherwise why not.
+   */
+  checkoutHome(checkout?: string, at?: { dir: string; repo?: string }): (Home & { link?: LinkedCheckout; at?: { dir: string; repo?: string } }) | string {
+    if (!checkout) return this.home({});
+    const link = this.links.find((l) => l.id === checkout && sameCheckout(l, at)) ?? (at ? this.links.find((l) => sameCheckout(l, at)) : undefined);
+    if (!link) return `${checkout} isn't on this floor any more`;
+    const own = this.home({ checkout: link.id });
+    if (typeof own === 'string') return own;
+    return { ...own, link, at: at ?? { dir: realDir(link.dir), repo: link.repo } };
+  }
+
   /** The folder of the checkout a worker works in, or the floor's own when it's one the floor no longer has (see stranded). */
   private homeDir(info: { id?: string; checkout?: string }): string {
     const own = this.home(info);
@@ -531,7 +546,8 @@ export class WorkerManager {
 
   /**
    * Hires a worker at a desk. `meeting` seats one at the meeting room's table instead, for that meeting
-   * (see meetings.ts), in the meeting's own worktree, which everyone at the table shares. `repos` are
+   * (see meetings.ts), in the meeting's own worktree, which everyone at the table shares (cut from the
+   * meeting's checkout, `checkout` then too). `repos` are
    * other floors' repositories a worker in its own worktree works in too (see makeWorkspace). With
    * `checkout`, one of this floor's linked checkouts, it works in that repository instead of the floor's
    * own (see WorkerInfo.checkout).
@@ -554,7 +570,7 @@ export class WorkerManager {
     if (repos.length && (kind !== 'agent' || !worktree || seat.station || meeting)) return 'Only a worker in its own worktree can work in other repositories too';
     if (repos.length > MAX_REPOS) return `A worker can take on at most ${MAX_REPOS} other repositories`;
     if (checkout && !this.links.some((l) => l.id === checkout)) return "That repository isn't on this floor any more";
-    if (checkout && (seat.station || meeting)) return "Board agents and meetings work in the floor's own checkout";
+    if (checkout && seat.station) return "Board agents work in the floor's own checkout";
     if (kind === 'shell' && provider !== undefined) return 'Shell workers do not have an agent provider';
     if (kind === 'agent' && selectedProvider === 'custom' && this.defaultProvider !== 'custom') return 'Custom is not the configured agent provider';
     if (kind === 'agent') {

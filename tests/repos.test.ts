@@ -8,7 +8,8 @@ import { Changes } from '../src/server/changes.js';
 import { excludeFromGit } from '../src/server/config.js';
 import { landedWorkers } from '../src/server/leave-on-merge.js';
 import { Ledger } from '../src/server/usage.js';
-import { WorkerManager, relatedBlock, withRelated, workspaceNames, type RepoSource, type WorkerEvents } from '../src/server/workers.js';
+import { WorkerManager, relatedBlock, repoSources, withRelated, workspaceNames, type LinkedCheckout, type RepoSource, type WorkerEvents } from '../src/server/workers.js';
+import type { LiveSession, ProcessProbe } from '../src/server/sessions.js';
 import { Worktrees } from '../src/server/worktrees.js';
 import type { ChangesState, GhPull, WorkerInfo } from '../src/shared/protocol.js';
 
@@ -360,4 +361,260 @@ test('a worker across repositories goes home once its pull requests have merged 
   assert.deepEqual(landedWorkers([apiOnly], [], [], floors([pull(9, 'MERGED', 'office/pip-1', 'h9')])).map((l) => l.prs), [['api #9']]);
   // web's own PR open: it stays.
   assert.deepEqual(landedWorkers([w], [pull(3, 'OPEN', 'office/pip-1')], [], floors([pull(9, 'MERGED', 'office/pip-1')])), []);
+});
+
+// A floor with more than one repository (see FloorLink): web's floor has api's checkout linked to it,
+// so workers are hired in api there, and Claude sessions in api's checkout sit at web's desks.
+
+const apiLink = (f: Fixture): LinkedCheckout => ({ id: 'api', name: 'api', repo: 'acme/api', dir: f.b });
+
+function linkedManager(f: Fixture, t: { after(fn: () => void): void }, links: LinkedCheckout[] = [apiLink(f)], probe?: ProcessProbe): WorkerManager {
+  const data = path.join(f.a, '.agent-office');
+  mkdirSync(data, { recursive: true });
+  const workers = new WorkerManager(f.a, data, f.agent, [], { url: 'http://127.0.0.1:1', token: '' }, events, new Ledger(data, { pauseHiring: false }, () => {}, () => {}), undefined, undefined, undefined, probe, links);
+  t.after(() => workers.shutdown());
+  return workers;
+}
+
+test('a worker hired in a linked checkout has its worktree cut from that repository, kept with the floor’s, and its PR there', async (t) => {
+  const f = fixture(t);
+  const workers = linkedManager(f, t);
+  const w = workers.spawn('desk-1', 'Cody', 'Work on GitHub issue #7: "Rate limits".', true, 'agent', undefined, undefined, undefined, undefined, undefined, [], 'api');
+  assert.equal(typeof w, 'object', String(w));
+  if (typeof w === 'string') return;
+  assert.equal(w.checkout, 'api');
+  const slug = w.worktree!.branch.replace(/^office\//, '');
+  const wt = path.join(f.a, '.agent-office', 'worktrees', slug);
+  assert.equal(w.worktree!.path, path.join('.agent-office', 'worktrees', slug));
+  // A worktree of api's repository, on the worker's branch, in web's .agent-office; nothing in api's checkout.
+  assert.equal(realpathSync(path.resolve(wt, git(wt, 'rev-parse', '--git-common-dir'))), realpathSync(path.join(f.b, '.git')));
+  assert.equal(git(f.b, 'branch', '--list', '--format=%(refname:short)', w.worktree!.branch), w.worktree!.branch);
+  assert.equal(git(f.a, 'branch', '--list', '--format=%(refname:short)', w.worktree!.branch), '');
+  assert.ok(!existsSync(path.join(f.b, '.agent-office')), 'nothing is written into the linked checkout');
+  const [start] = await waitFor(() => f.starts(), (s) => s.length === 1);
+  assert.equal(realpathSync(start.cwd), realpathSync(wt));
+
+  // O pushes to api's origin and opens the pull request there.
+  writeFileSync(path.join(wt, 'limits.js'), '// limits\n');
+  git(wt, 'add', '-A');
+  git(wt, 'commit', '-q', '-m', 'Rate limits');
+  (workers as any).workers.get(w.id).info.status = 'done';
+  const r = await workers.openPr(w.id, 'Cody');
+  assert.equal(typeof r, 'object', String(r));
+  assert.deepEqual(f.prs().map((p) => [p.repo, p.head, p.base]), [['acme/api', w.worktree!.branch, 'main']]);
+  assert.match(f.prs()[0].body, /\nCloses #7\n/);
+  assert.deepEqual(workers.get(w.id)?.pr, { number: 1, url: 'https://github.com/acme/api/pull/1' });
+  assert.equal((await workers.inspectWorktree(w.id))?.exists, true);
+
+  // Sending it home looks in api's repository: its commit is on api's origin now, so worktree and branch go.
+  const home = await workers.kill(w.id);
+  assert.equal(home.note, `Deleted ${w.name}'s worktree and branch ${w.worktree!.branch}`);
+  assert.ok(!existsSync(wt));
+  assert.equal(git(f.b, 'branch', '--list', '--format=%(refname:short)', w.worktree!.branch), '');
+});
+
+test('a worker in a linked checkout without a worktree runs there, and comes back only while the floor still has it', async (t) => {
+  const f = fixture(t);
+  const workers = linkedManager(f, t);
+  const w = workers.spawn('desk-1', 'Cody', undefined, false, 'agent', undefined, undefined, undefined, undefined, undefined, [], 'api') as WorkerInfo;
+  assert.equal(w.checkout, 'api');
+  const [start] = await waitFor(() => f.starts(), (s) => s.length === 1);
+  assert.equal(realpathSync(start.cwd), realpathSync(f.b));
+  assert.match(String(workers.spawn('desk-2', 'Cody', undefined, false, 'agent', undefined, undefined, undefined, undefined, undefined, [], 'nope')), /isn't on this floor/);
+  assert.match(String(workers.spawn('station-queue', 'Cody', 'queue it', false, 'agent', undefined, undefined, undefined, undefined, undefined, [], 'api')), /floor's own checkout/);
+  assert.deepEqual(workers.onCheckout('api'), [w.name]);
+
+  // workers.json keeps which checkout it's in.
+  workers.shutdown();
+  const saved = JSON.parse(readFileSync(path.join(f.a, '.agent-office', 'workers.json'), 'utf8')) as { id: string; checkout?: string }[];
+  assert.equal(saved.find((s) => s.id === w.id)?.checkout, 'api');
+  const again = linkedManager(f, t);
+  assert.equal(again.get(w.id)?.checkout, 'api');
+  again.shutdown();
+  // A floor that no longer has that checkout keeps it, but never in its own checkout instead (see stranded).
+  const without = linkedManager(f, t, []);
+  assert.match(String(without.stranded(w.id)), /works in api, which isn't on this floor any more/);
+  without.shutdown();
+  // An older workers.json, with no checkout at all, is the floor's own as before.
+  writeFileSync(path.join(f.a, '.agent-office', 'workers.json'), JSON.stringify(saved.map(({ checkout: _, ...s }) => s)));
+  const older = linkedManager(f, t);
+  assert.equal(older.get(w.id)?.checkout, undefined);
+});
+
+test('a Claude session in a terminal in a linked checkout sits at the floor’s desks, working in that checkout', async (t) => {
+  const f = fixture(t);
+  const alive = new Set([51001, 51002, 51003]);
+  const probe: ProcessProbe = { alive: (pid) => alive.has(pid), startedAt: () => undefined, parent: () => undefined };
+  const workers = linkedManager(f, t, [apiLink(f)], probe);
+  const live = (pid: number, cwd: string): LiveSession => ({ pid, sessionId: `s-${pid}`, cwd, startedAt: 1790709600377 });
+  const own = workers.spawn('desk-1', 'Cody', undefined, true, 'agent', undefined, undefined, undefined, undefined, undefined, [], 'api') as WorkerInfo;
+  workers.syncTerminals([
+    live(51001, path.join(f.b, 'src')),
+    live(51002, f.a),
+    // In the office's own worktree of api, kept in web's .agent-office: the office's worker, not a terminal's.
+    live(51003, path.join(f.a, own.worktree!.path)),
+  ], () => undefined);
+  const seated = workers.list().filter((w) => w.external);
+  assert.deepEqual(seated.map((w) => [w.external!.pid, w.checkout]).sort(), [[51001, 'api'], [51002, undefined]]);
+
+  // It comes back after a restart with the folder it ran in, which is one of the floor's.
+  workers.shutdown();
+  const again = linkedManager(f, t, [apiLink(f)], probe);
+  const back = again.list().find((w) => w.external?.pid === 51001);
+  assert.equal(back?.checkout, 'api');
+  assert.equal((again as any).workers.get(back!.id).terminal.cwd, path.join(f.b, 'src'));
+});
+
+test('a worker hired in a linked checkout can work in the floor’s own repository too, in one workspace', async (t) => {
+  const f = fixture(t);
+  const workers = linkedManager(f, t);
+  // The floor's own checkout, by its floor (no checkout), as "🗂️ Also work in" sends it.
+  const w = workers.spawn('desk-1', 'Cody', undefined, true, 'agent', undefined, undefined, undefined, undefined, undefined, [{ floor: 'web', name: 'web', repo: 'acme/web', dir: f.a }], 'api') as WorkerInfo;
+  assert.equal(typeof w, 'object', String(w));
+  const slug = w.worktree!.branch.replace(/^office\//, '');
+  const ws = path.join(f.a, '.agent-office', 'worktrees', slug);
+  assert.equal(w.worktree!.path, path.join('.agent-office', 'worktrees', slug, 'api'));
+  assert.deepEqual(w.repos!.map((r) => [r.floor, r.checkout, r.name, r.dir]), [['web', undefined, 'web', f.a]]);
+  for (const [name, dir] of [['api', f.b], ['web', f.a]]) {
+    assert.equal(realpathSync(path.resolve(path.join(ws, name), git(path.join(ws, name), 'rev-parse', '--git-common-dir'))), realpathSync(path.join(dir, '.git')));
+  }
+  assert.ok(readFileSync(path.join(ws, 'CLAUDE.md'), 'utf8').includes('`api/`: acme/api'));
+  // The same repository twice is refused, as across floors.
+  assert.match(String(workers.spawn('desk-2', 'Cody', undefined, true, 'agent', undefined, undefined, undefined, undefined, undefined, [{ floor: 'web', checkout: 'api', name: 'api', dir: f.b }], 'api')), /same repository/);
+  // Sending it home clears both worktrees and the workspace.
+  const home = await workers.kill(w.id);
+  assert.match(String(home.note), /^Deleted .*'s worktrees and branch/);
+  assert.ok(!existsSync(ws));
+});
+
+test('a worker whose linked repository is off the floor stays at its desk, terminal and worktree kept, until it’s back', async (t) => {
+  const f = fixture(t);
+  const first = linkedManager(f, t);
+  await first.start();
+  const w = first.spawn('desk-1', 'Cody', undefined, true, 'agent', undefined, undefined, undefined, undefined, undefined, [], 'api') as WorkerInfo;
+  await waitFor(() => f.starts(), (s) => s.length === 1);
+  // The office restarts; its terminal keeps running in the host.
+  first.shutdown(true);
+
+  // Back without api on the floor (taken off and added again by an older office, say).
+  const off = linkedManager(f, t, []);
+  await off.start();
+  const why = `${w.name} works in api, which isn't on this floor any more — add it back to carry on`;
+  assert.equal(off.stranded(w.id), why);
+  assert.equal(off.get(w.id)?.activity, why);
+  assert.equal(off.resume(w.id), why);
+  assert.deepEqual(await off.kill(w.id), { error: why });
+  assert.ok(off.get(w.id), 'still at its desk');
+  assert.equal((await off.inspectWorktree(w.id))?.error, why);
+  assert.deepEqual(await off.openPr(w.id, 'Cody'), why);
+  // Nothing of api's or the floor's own was touched, and workers.json still has it, terminal and all.
+  assert.equal(git(f.b, 'branch', '--list', '--format=%(refname:short)', w.worktree!.branch), w.worktree!.branch);
+  assert.ok(existsSync(path.join(f.a, w.worktree!.path)));
+  const saved = (JSON.parse(readFileSync(path.join(f.a, '.agent-office', 'workers.json'), 'utf8')) as { id: string; checkout?: string; checkoutName?: string; pty?: { id: string } }[]).find((x) => x.id === w.id);
+  assert.deepEqual([saved?.checkout, saved?.checkoutName, !!saved?.pty?.id], ['api', 'api', true]);
+  assert.equal(f.starts().length, 1, 'nothing was started again');
+
+  // api is back: so is the worker, on the terminal that kept running.
+  off.setLinks([apiLink(f)]);
+  await waitFor(() => off.get(w.id)?.status, (s) => s !== 'offline');
+  assert.equal(off.stranded(w.id), undefined);
+  assert.equal(f.starts().length, 1, 'picked its terminal back up rather than starting another');
+});
+
+test('repoSources looks each repository up as the building has it now', () => {
+  const dirs: Record<string, { name: string; repo?: string; dir: string }> = { feyer: { name: 'feyer', dir: '/p/feyer' }, 'feyer:feyer-app': { name: 'feyer-app', repo: 'acme/feyer-app', dir: '/p/feyer-app' } };
+  const find = (at: { floor: string; checkout?: string }) => dirs[at.checkout ? `${at.floor}:${at.checkout}` : at.floor];
+  assert.deepEqual(repoSources(['feyer:feyer-app'], 'feyer', find), [{ floor: 'feyer', checkout: 'feyer-app', name: 'feyer-app', repo: 'acme/feyer-app', dir: '/p/feyer-app' }]);
+  assert.match(String(repoSources(['feyer'], 'feyer', find)), /own project/);
+  // Gone since the hire dialog listed it.
+  delete dirs['feyer:feyer-app'];
+  assert.match(String(repoSources(['feyer:feyer-app'], 'feyer', find)), /no longer in the building/);
+});
+
+test('a worker’s PR closes an issue in another of the floor’s repositories by naming it', async (t) => {
+  const f = fixture(t);
+  const workers = linkedManager(f, t);
+  const w = workers.spawn('desk-1', 'Cody', 'Work on GitHub issue acme/web#9: "Shared login".', true, 'agent', undefined, undefined, undefined, undefined, undefined, [], 'api') as WorkerInfo;
+  const wt = path.join(f.a, w.worktree!.path);
+  await waitFor(() => workers.get(w.id)?.status, (s) => s !== 'starting');
+  writeFileSync(path.join(wt, 'login.js'), '// login\n');
+  git(wt, 'add', '-A');
+  git(wt, 'commit', '-q', '-m', 'Shared login');
+  (workers as any).workers.get(w.id).info.status = 'done';
+  assert.equal(typeof (await workers.openPr(w.id, 'Cody')), 'object');
+  const [pr] = f.prs();
+  assert.equal(pr.repo, 'acme/api');
+  assert.equal(pr.title, 'Shared login');
+  assert.match(pr.body, /\nCloses acme\/web#9\n/);
+
+  // Its own repository's issue, named the same way, needs no name.
+  const own = workers.spawn('desk-2', 'Cody', 'Work on GitHub issue acme/api#4: "Rate limits".', true, 'agent', undefined, undefined, undefined, undefined, undefined, [], 'api') as WorkerInfo;
+  const owt = path.join(f.a, own.worktree!.path);
+  await waitFor(() => workers.get(own.id)?.status, (s) => s !== 'starting');
+  writeFileSync(path.join(owt, 'limits.js'), '// limits\n');
+  git(owt, 'add', '-A');
+  git(owt, 'commit', '-q', '-m', 'Rate limits');
+  (workers as any).workers.get(own.id).info.status = 'done';
+  assert.equal(typeof (await workers.openPr(own.id, 'Cody')), 'object');
+  assert.match(f.prs()[1].body, /\nCloses #4\n/);
+});
+
+test('a worker whose repository went only comes back for that same repository, under whatever name it’s linked again', async (t) => {
+  const f = fixture(t);
+  const first = linkedManager(f, t);
+  const w = first.spawn('desk-1', 'Cody', undefined, true, 'agent', undefined, undefined, undefined, undefined, undefined, [], 'api') as WorkerInfo;
+  await waitFor(() => f.starts(), (s) => s.length === 1);
+  first.shutdown();
+  const saved = (JSON.parse(readFileSync(path.join(f.a, '.agent-office', 'workers.json'), 'utf8')) as { id: string; checkoutAt?: { dir: string; repo?: string } }[]).find((x) => x.id === w.id);
+  assert.deepEqual(saved?.checkoutAt, { dir: realpathSync(f.b), repo: 'acme/api' });
+
+  const off = linkedManager(f, t, []);
+  // Another repository linked under the same id isn't its.
+  off.setLinks([{ id: 'api', name: 'admin', repo: 'acme/admin', dir: f.c }]);
+  assert.ok(off.stranded(w.id));
+  assert.deepEqual(off.onCheckout('api'), [], "that id's new repository has nobody working in it");
+  // Its own repository, linked as api-2: it works in that one now.
+  off.setLinks([{ id: 'api', name: 'admin', repo: 'acme/admin', dir: f.c }, { id: 'api-2', name: 'api', repo: 'acme/api', dir: f.b }]);
+  assert.equal(off.stranded(w.id), undefined);
+  assert.equal(off.get(w.id)?.checkout, 'api-2');
+  await waitFor(() => f.starts(), (s) => s.length === 2);
+});
+
+test('an admin can forget a worker whose repository went: its worktree and branch stay for prune, its terminal ends', async (t) => {
+  const f = fixture(t);
+  const first = linkedManager(f, t);
+  await first.start();
+  const w = first.spawn('desk-1', 'Cody', undefined, true, 'agent', undefined, undefined, undefined, undefined, undefined, [], 'api') as WorkerInfo;
+  await waitFor(() => f.starts(), (s) => s.length === 1);
+  first.shutdown(true);
+  const savedPty = () => (JSON.parse(readFileSync(path.join(f.a, '.agent-office', 'workers.json'), 'utf8')) as { id: string; pty?: { id: string; pid?: number } }[]).find((x) => x.id === w.id)?.pty;
+  const pid = savedPty()?.pid;
+  assert.ok(pid, 'the terminal’s process is kept with it');
+
+  const off = linkedManager(f, t, [], { alive: (p) => p === pid, startedAt: () => undefined, parent: () => undefined });
+  await off.start();
+  // Its terminal's Claude, still running, is the office's own: it isn't seated again as someone's terminal.
+  off.syncTerminals([{ pid: pid!, sessionId: 'its-own', cwd: f.a, startedAt: 1 }], () => undefined);
+  assert.deepEqual(off.list().filter((x) => x.external), []);
+
+  assert.match(String(off.forget('nope')), /No such worker/);
+  const r = off.forget(w.id);
+  assert.equal(typeof r, 'object', String(r));
+  const wt = path.join(f.a, w.worktree!.path);
+  assert.match((r as { note: string }).note, new RegExp(`^Forgot ${w.name}: its worktree ${wt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} and branch ${w.worktree!.branch} are still there — run agent-office prune`));
+  assert.equal(off.get(w.id), undefined);
+  assert.ok(existsSync(wt), 'its worktree is left');
+  assert.equal(git(f.b, 'branch', '--list', '--format=%(refname:short)', w.worktree!.branch), w.worktree!.branch, 'and its branch');
+  assert.equal(savedPty(), undefined);
+  assert.ok(!(JSON.parse(readFileSync(path.join(f.a, '.agent-office', 'workers.json'), 'utf8')) as { id: string }[]).some((x) => x.id === w.id));
+  // Its terminal goes.
+  await waitFor(() => { try { process.kill(pid!, 0); return true; } catch { return false; } }, (alive) => !alive);
+});
+
+test('only a worker whose repository went can be forgotten', async (t) => {
+  const f = fixture(t);
+  const workers = linkedManager(f, t);
+  const w = workers.spawn('desk-1', 'Cody', undefined, false, 'agent', undefined, undefined, undefined, undefined, undefined, [], 'api') as WorkerInfo;
+  assert.match(String(workers.forget(w.id)), /send it home as usual/);
+  assert.ok(workers.get(w.id));
 });

@@ -1,4 +1,5 @@
 import type { WorkerInfo } from '../../shared/protocol';
+import { repoKey } from '../../shared/floors';
 import { isBusy } from '../../shared/status';
 import { store } from '../state';
 import { h, openModal } from './dom';
@@ -6,10 +7,13 @@ import { h, openModal } from './dom';
 // A worker across repositories (see WorkerInfo.repos): one task in worktrees of several floors'
 // projects, all on the same branch, with a pull request in each repository it commits to.
 
-/** Each of a worker's repositories, its own floor's first (no `floor`): the folder in its workspace, and its pull request. */
-export function workerRepos(w: WorkerInfo): { floor?: string; name: string; pr?: { number: number; url: string } }[] {
+/**
+ * Each of a worker's repositories, its own first (no `floor`): the folder in its workspace, and its
+ * pull request. `key` (a repoKey) is what the Changes window calls each of the others.
+ */
+export function workerRepos(w: WorkerInfo): { floor?: string; key?: string; name: string; pr?: { number: number; url: string } }[] {
   if (!w.worktree) return [];
-  return [{ name: w.worktree.path.split(/[\\/]/).pop() || 'project', pr: w.pr }, ...(w.repos ?? []).map((r) => ({ floor: r.floor, name: r.name, pr: r.pr }))];
+  return [{ name: w.worktree.path.split(/[\\/]/).pop() || 'project', pr: w.pr }, ...(w.repos ?? []).map((r) => ({ floor: r.floor, key: repoKey(r), name: r.name, pr: r.pr }))];
 }
 
 export interface RepoPullsActions {
@@ -43,14 +47,16 @@ export function openRepoPulls(workerId: string, actions: RepoPullsActions) {
       ...repos.map((r) => {
         const floor = r.floor ? store.floors.find((f) => f.id === r.floor)?.name : store.currentFloor()?.name;
         const pr = r.pr;
+        // On this floor (its own repository, or one linked to the floor): its PR is on the board here.
+        const here = !r.floor || r.floor === store.floor;
         return h(
           'li',
           {},
-          h('span.name', {}, `📁 ${r.name}`, h('small', {}, floor ? `${floor} floor${r.floor ? '' : ' · this one'}` : 'no longer in the building')),
+          h('span.name', {}, `📁 ${r.name}`, h('small', {}, floor ? `${floor} floor${here ? ' · this one' : ''}` : 'no longer in the building')),
           pr
-            ? h('button.btn', { type: 'button', title: r.floor ? 'Open it on GitHub' : 'Open it', onclick: () => (r.floor ? window.open(pr.url, '_blank', 'noopener') : (modal.close(), actions.openPull(pr.number, pr.url))) }, `🔀 #${pr.number}${r.floor ? ' ↗' : ''}`)
+            ? h('button.btn', { type: 'button', title: here ? 'Open it' : 'Open it on GitHub', onclick: () => (here ? (modal.close(), actions.openPull(pr.number, pr.url)) : window.open(pr.url, '_blank', 'noopener')) }, `🔀 #${pr.number}${here ? '' : ' ↗'}`)
             : h('span.none', {}, 'No PR yet'),
-          h('button.btn', { type: 'button', title: `What ${w.name} changed in ${r.name}`, onclick: () => (modal.close(), actions.changes(r.floor)) }, '🌿 Changes'),
+          h('button.btn', { type: 'button', title: `What ${w.name} changed in ${r.name}`, onclick: () => (modal.close(), actions.changes(r.key)) }, '🌿 Changes'),
         );
       }),
     );

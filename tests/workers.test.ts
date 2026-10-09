@@ -1,6 +1,6 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { accessSync, appendFileSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, appendFileSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -9,11 +9,13 @@ import { CARRY_ON_PROMPT, WorkerManager, type WorkerEvents } from '../src/server
 import { Worktrees } from '../src/server/worktrees.js';
 import type { AgentProvider, WorkerInfo } from '../src/shared/protocol.js';
 import type { PromptSource } from '../src/server/prompts.js';
+import type { LiveSession, ProcessProbe } from '../src/server/sessions.js';
 import { PROMPTS } from '../src/shared/prompts.js';
 
 type Invocation = {
   kind: string;
   args: string[];
+  cwd?: string;
   stdin?: string;
   env: {
     workerId?: string;
@@ -80,6 +82,17 @@ function isolateProviderEnvironment(f: Fixture, t: { after(fn: () => void): void
   });
 }
 
+// The office looks in Claude's session registry before resuming a conversation (see sessions.ts):
+// every test here gets an empty one of its own, never the real ~/.claude/sessions.
+const claudeHome = mkdtempSync(path.join(tmpdir(), 'agent-office-claude-'));
+const realClaudeHome = process.env.CLAUDE_CONFIG_DIR;
+process.env.CLAUDE_CONFIG_DIR = claudeHome;
+after(() => {
+  if (realClaudeHome === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+  else process.env.CLAUDE_CONFIG_DIR = realClaudeHome;
+  rmSync(claudeHome, { recursive: true, force: true });
+});
+
 const fakeAgent = `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
@@ -90,6 +103,7 @@ const record = (extra = {}) => fs.appendFileSync(log, JSON.stringify({
   kind,
   args,
   ...extra,
+  cwd: process.cwd(),
   env: {
     workerId: process.env.AGENT_OFFICE_WORKER_ID,
     hookToken: process.env.AGENT_OFFICE_HOOK_TOKEN,
@@ -166,8 +180,10 @@ function ledger(data: string): Ledger {
   return new Ledger(data, { pauseHiring: false }, () => {}, () => {});
 }
 
-function manager(f: Fixture, cmd: string, updates: WorkerInfo[], args = ['--from-test']) {
-  return new WorkerManager(f.root, f.data, cmd, args, { url: 'http://127.0.0.1:1', token: '' }, events(updates), ledger(f.data));
+function manager(f: Fixture, cmd: string, updates: WorkerInfo[], args = ['--from-test'], probe?: ProcessProbe, toasts: string[] = []) {
+  const ev = events(updates);
+  ev.toast = (text) => toasts.push(text);
+  return new WorkerManager(f.root, f.data, cmd, args, { url: 'http://127.0.0.1:1', token: '' }, ev, ledger(f.data), undefined, undefined, undefined, probe);
 }
 
 async function waitFor<T>(read: () => T, predicate: (value: T) => boolean, timeout = 4000): Promise<T> {
@@ -453,8 +469,10 @@ test('an explicit Claude model/effort overrides --agent-args and persists across
   assert.equal(workers.handleHook(worker.id, firstInvocation.env.hookToken!, 'SessionStart', { session_id: 'claude-model-1' }), true);
   await waitFor(() => workers.get(worker.id)?.status, (status) => status === 'exited');
   assert.equal(workers.resume(worker.id), undefined);
-  const resumed = await waitFor(() => f.read(), (records) => records.filter((r) => r.kind === 'claude').length >= 2);
-  const secondInvocation = resumed.filter((r) => r.kind === 'claude')[1];
+  // Only the worker's own launches: the task namer runs `claude -p` too, and may finish first.
+  const launched = (records: typeof first) => records.filter((r) => r.kind === 'claude' && !r.args.includes('-p'));
+  const resumed = await waitFor(() => f.read(), (records) => launched(records).length >= 2);
+  const secondInvocation = launched(resumed)[1];
   assert.ok(secondInvocation.args.includes('--model'));
   assert.ok(secondInvocation.args.includes('haiku'));
   assert.ok(secondInvocation.args.includes('--effort'));
@@ -1229,4 +1247,223 @@ test("only a branch the worker made is its own to delete, and the office's stays
   assert.equal(await trees.remove({ ...made, branch: 'fix-y', made: made.branch }, 'all'), undefined);
   assert.equal(git('branch', '--list', 'fix-y'), '');
   assert.equal(git('branch', '--list', made.branch).replace(/^\*?\s+/, ''), made.branch);
+});
+
+/** A Claude Code session in someone's terminal, as sessions.ts reads it from the registry. */
+const terminal = (pid: number, sessionId: string, cwd: string, procStart?: string): LiveSession => ({ pid, sessionId, cwd, startedAt: 1790709600377, version: '2.1.284', procStart });
+
+/** Processes as the test says they are: which pids are running, when they started, and their parents. */
+function processes(alive: Set<number>, starts = new Map<number, number>(), parents = new Map<number, number>()): ProcessProbe {
+  return { alive: (pid) => alive.has(pid), startedAt: (pid) => starts.get(pid), parent: (pid) => parents.get(pid) };
+}
+
+/** Puts a session in the registry the office reads ($CLAUDE_CONFIG_DIR, in the fixture's folder). */
+function register(s: LiveSession) {
+  const dir = path.join(process.env.CLAUDE_CONFIG_DIR!, 'sessions');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, `${s.pid}.json`), JSON.stringify({ ...s, kind: 'interactive' }));
+}
+
+test("a Claude session in someone's terminal sits at a desk and is never started by the office, not even once it ends", async (t) => {
+  const f = carryOnFixture(t);
+  const alive = new Set([41001, 41002]);
+  const probe = processes(alive);
+  const updates: WorkerInfo[] = [];
+  const workers = manager(f, f.claude, updates, undefined, probe);
+  t.after(() => workers.shutdown());
+  await workers.start();
+  const title = () => 'Fix the login page';
+  const sub = path.join(f.root, 'src');
+  mkdirSync(sub);
+  const live = [
+    terminal(41001, 'in-terminal', sub),
+    terminal(41002, 'at-the-top', f.root),
+    // The office's own worktrees are its workers', and somewhere else isn't this floor.
+    terminal(41003, 'in-a-worktree', path.join(f.root, '.agent-office', 'worktrees', 'pixel-1234')),
+    terminal(41004, 'elsewhere', path.join(path.dirname(f.root), 'another-project')),
+  ];
+  workers.syncTerminals(live, title);
+  const seated = workers.list();
+  assert.deepEqual(seated.map((w) => w.sessionId).sort(), ['at-the-top', 'in-terminal']);
+  const w = seated.find((x) => x.sessionId === 'in-terminal')!;
+  assert.deepEqual([w.kind, w.provider, w.status, w.name, w.createdBy, w.external?.pid], ['agent', 'claude', 'offline', 'Fix the login page', 'terminal', 41001]);
+  assert.notEqual(seated[0].deskId, seated[1].deskId);
+  assert.ok(updates.some((u) => u.id === w.id), 'everyone on the floor hears about it');
+  workers.syncTerminals(live, title);
+  assert.equal(workers.list().length, 2, 'no second worker for the same session');
+
+  // Nothing starts it: not waking everyone up, not R, not a prompt.
+  workers.wakeAll();
+  assert.match(workers.resume(w.id) ?? '', /running in your terminal/);
+  assert.equal(workers.prompt(w.id, 'hello'), 'Worker is not running');
+  assert.match(workers.attach(w.id, 'c1', 'Sam')!.data, /running in your terminal \(PID 41001\)/);
+  workers.detach(w.id, 'c1');
+
+  // A registry that can't be read, or that misses it once while it's still running, changes nothing.
+  workers.syncTerminals(null, title);
+  workers.syncTerminals([], title);
+  assert.equal(workers.get(w.id)?.external?.pid, 41001);
+
+  // A restarted office has it back, still in the terminal, and doesn't start it either.
+  workers.shutdown(true);
+  const toasts: string[] = [];
+  const after = manager(f, f.claude, [], undefined, probe, toasts);
+  t.after(() => after.shutdown());
+  await after.start();
+  assert.equal(after.get(w.id)?.external?.pid, 41001);
+
+  // Its terminal session ends: asleep at its desk, and not woken with everyone else.
+  alive.delete(41001);
+  after.syncTerminals([terminal(41002, 'at-the-top', f.root)], title);
+  const ended = after.get(w.id)!;
+  assert.equal(ended.external, undefined);
+  assert.equal(ended.status, 'offline');
+  assert.ok(toasts.some((x) => /press R at its desk to carry it on/.test(x)), toasts.join());
+  after.wakeAll();
+  // ...not after a restart either.
+  after.shutdown(true);
+  const third = manager(f, f.claude, [], undefined, probe);
+  t.after(() => third.shutdown());
+  await third.start();
+  third.wakeAll();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(launches(f).length, 0, 'no Claude was launched for a session from a terminal');
+
+  // R carries it on, in the folder its session ran in (where Claude keeps the conversation).
+  assert.equal(third.resume(w.id), undefined);
+  const [resumed] = await waitFor(() => launches(f), (x) => x.length >= 1);
+  assert.deepEqual(resumed.args.slice(resumed.args.indexOf('--resume'), resumed.args.indexOf('--resume') + 2), ['--resume', 'in-terminal']);
+  assert.equal(realpathSync(resumed.cwd!), realpathSync(sub));
+  assert.equal(promptOf(resumed), undefined, 'nothing to carry on: it just picks the conversation back up');
+});
+
+test("a pid that's come round again for another process isn't the terminal's session any more", async (t) => {
+  const f = carryOnFixture(t);
+  const alive = new Set([43001]);
+  const starts = new Map([[43001, Date.parse('Tue Sep 29 19:19:59 2026 UTC')]]);
+  const workers = manager(f, f.claude, [], undefined, processes(alive, starts));
+  t.after(() => workers.shutdown());
+  await workers.start();
+  // Seen in the registry while its process ran; then the registry loses it, and that pid is a process
+  // started an hour later: something else.
+  workers.syncTerminals([terminal(43001, 'reused', f.root, 'Tue Sep 29 19:19:59 2026')], () => undefined);
+  const [w] = workers.list();
+  starts.set(43001, Date.parse('Tue Sep 29 20:19:59 2026 UTC'));
+  workers.syncTerminals([], () => undefined);
+  assert.equal(workers.get(w.id)?.external, undefined);
+});
+
+test("the office never resumes a conversation that's open in a terminal outside it; it says so, and seats it as that terminal's", async (t) => {
+  const f = carryOnFixture(t);
+  const workers = manager(f, f.claude, []);
+  t.after(() => workers.shutdown());
+  // An office worker whose conversation someone opens in a terminal (claude --resume there).
+  const w = await hireInState(f, workers, 'desk-2', 'held-session', 'done');
+  const launched = launches(f).length;
+  // This test's own process stands in for the terminal's Claude: it's running, and not the office's.
+  const outside = terminal(process.pid, 'held-session', f.root);
+  // In the fixture's own Claude config folder, which goes with it.
+  register(outside);
+  // Its terminal in the office goes away. A plain stop, not a restart's detach: a detached host
+  // would outlive the test with its terminal still running.
+  workers.shutdown();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const after = manager(f, f.claude, []);
+  t.after(() => after.shutdown());
+  await after.start();
+  after.wakeAll();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(launches(f).length, launched, 'not woken while the terminal has it open');
+  assert.equal(after.resume(w.id), `${w.name}'s conversation is open in a terminal (PID ${process.pid}) — close it there or use Take over`);
+
+  // The next look seats it as the terminal's, and taking it over is the one way it starts here.
+  after.syncTerminals(undefined, () => undefined);
+  assert.equal(after.get(w.id)?.external?.pid, process.pid);
+  assert.equal(after.list().length, 1);
+  assert.deepEqual(after.takeOver(w.id), { pid: process.pid });
+  const [taken] = (await waitFor(() => launches(f), (x) => x.length > launched)).slice(launched);
+  assert.ok(taken.args.includes('--resume') && taken.args.includes('held-session'));
+});
+
+test("an office worker's Claude, started under its terminal, isn't seated again as a terminal's session", async (t) => {
+  const f = carryOnFixture(t);
+  const parents = new Map<number, number>();
+  const workers = manager(f, f.claude, [], undefined, processes(new Set([44001]), new Map(), parents));
+  t.after(() => workers.shutdown());
+  await workers.start();
+  const w = workers.spawn('desk-1', 'test', 'work');
+  assert.notEqual(typeof w, 'string');
+  await waitFor(() => launches(f), (x) => x.length >= 1);
+  const pty = await waitFor(() => workers.owners().find((o) => o.workerId === (w as WorkerInfo).id)?.pid, (pid) => !!pid);
+  // Its Claude, two processes down from its terminal (a shell in between), before its hooks name its session.
+  parents.set(44001, 44000);
+  parents.set(44000, pty!);
+  workers.syncTerminals([terminal(44001, 'not-yet-reported', f.root)], () => undefined);
+  assert.equal(workers.list().length, 1);
+});
+
+test('taking over a session from a terminal resumes its conversation where it ran, and it never comes back as a second worker', async (t) => {
+  const f = carryOnFixture(t);
+  const alive = new Set([42001, 42002]);
+  const workers = manager(f, f.claude, [], undefined, processes(alive));
+  t.after(() => workers.shutdown());
+  await workers.start();
+  const live = [terminal(42001, 'take-me', f.root), terminal(42002, 'leave-me', f.root)];
+  workers.syncTerminals(live, () => undefined);
+  const [mine, theirs] = ['take-me', 'leave-me'].map((id) => workers.list().find((w) => w.sessionId === id)!);
+  assert.equal(mine.name, 'Terminal session');
+
+  assert.match(workers.takeOver('nope') as string, /No such worker/);
+  assert.deepEqual(workers.takeOver(mine.id), { pid: 42001 });
+  const [launched] = await waitFor(() => launches(f), (x) => x.length >= 1);
+  assert.deepEqual(launched.args.slice(launched.args.indexOf('--resume'), launched.args.indexOf('--resume') + 2), ['--resume', 'take-me']);
+  assert.equal(launched.env.workerId, mine.id);
+  assert.equal(workers.get(mine.id)?.external, undefined);
+  assert.match(workers.takeOver(mine.id) as string, /isn't in a terminal/);
+
+  // Still open in the terminal (until they close it there), maybe on a conversation of its own by
+  // now: it stays the office's one worker.
+  workers.syncTerminals([terminal(42001, 'forked-in-the-terminal', f.root), live[1]], () => undefined);
+  assert.equal(workers.list().length, 2);
+
+  // Sent home from its desk, a terminal session carries on there and doesn't sit back down.
+  await workers.kill(theirs.id);
+  workers.syncTerminals(live, () => undefined);
+  assert.deepEqual(workers.list().map((w) => w.id), [mine.id]);
+  // Once that process is gone its pid is free again.
+  alive.delete(42002);
+  workers.syncTerminals([], () => undefined);
+  alive.add(42002);
+  workers.syncTerminals([terminal(42002, 'a-new-one', f.root)], () => undefined);
+  assert.equal(workers.list().length, 2);
+});
+
+test("only sessions in this floor's checkout have their parents looked up, and a worker's own Claude on its way out never blocks its resume", async (t) => {
+  const f = carryOnFixture(t);
+  const oldExit = process.env.FAKE_AGENT_EXIT_MS;
+  process.env.FAKE_AGENT_EXIT_MS = '600';
+  t.after(() => {
+    if (oldExit === undefined) delete process.env.FAKE_AGENT_EXIT_MS;
+    else process.env.FAKE_AGENT_EXIT_MS = oldExit;
+  });
+  const alive = new Set<number>();
+  let asked = 0;
+  const probe: ProcessProbe = { alive: (pid) => alive.has(pid), startedAt: () => undefined, parent: () => (asked++, undefined) };
+  const workers = manager(f, f.claude, [], undefined, probe);
+  t.after(() => workers.shutdown());
+  const w = workers.spawn('desk-1', 'test', 'work');
+  if (typeof w === 'string') throw new Error(w);
+  const [run] = await waitFor(() => launches(f), (x) => x.length >= 1);
+  assert.equal(workers.handleHook(w.id, run.env.hookToken!, 'SessionStart', { session_id: 'own-session' }), true);
+  const pty = await waitFor(() => workers.owners().find((o) => o.workerId === w.id)?.pid, (pid) => !!pid);
+
+  // Somewhere else on the machine: not this floor's, so nobody asks whose child it is.
+  workers.syncTerminals([terminal(45001, 'elsewhere', path.join(path.dirname(f.root), 'other'))], () => undefined);
+  assert.equal(asked, 0);
+
+  // Its terminal goes, and its Claude is still in the registry for a moment, holding its session.
+  await waitFor(() => workers.get(w.id)?.status, (s) => s === 'exited');
+  alive.add(pty!);
+  register(terminal(pty!, 'own-session', f.root));
+  assert.equal(workers.resume(w.id), undefined, "the worker's own Claude isn't someone else's terminal");
 });

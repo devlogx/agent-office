@@ -88,6 +88,13 @@ export function isMeetingPattern(v: unknown): v is MeetingPattern {
 export const TOKENS_PER_SEAT = 1_000_000;
 /** The most a meeting may be given, however many workers sit down. */
 export const MAX_MEETING_BUDGET = 50_000_000;
+/** A budget of 0 means no token limit: the meeting runs until its output is written or its rounds are up. */
+export const NO_MEETING_BUDGET = 0;
+
+/** "300k tokens", or "no token limit" for a meeting called with budget 0. */
+export function meetingBudgetLabel(budget: number): string {
+  return budget > NO_MEETING_BUDGET ? `${fmtTokens(budget)} tokens` : 'no token limit';
+}
 
 /**
  * The round notes' folder at the top of a meeting's worktree. It's left out of the meeting's commit and

@@ -9,10 +9,13 @@ import type { MeetingPreset } from './meeting';
 import { officePrompt } from './prompts';
 
 export interface BoardActions {
-  /** Start a worker on a ready-made prompt (shown for editing first). */
-  assign(prompt: string, title: string): void;
-  /** Your own prompt about an issue or PR; `context` goes first so the worker knows which. */
-  ask(context: string, title: string): void;
+  /**
+   * Start a worker on a ready-made prompt (shown for editing first). `checkout` is the repository the
+   * issue or PR is in, when it's one linked to the floor (see GhIssue.checkout): a new worker starts there.
+   */
+  assign(prompt: string, title: string, checkout?: string): void;
+  /** Your own prompt about an issue or PR; `context` goes first so the worker knows which. `checkout` as for assign. */
+  ask(context: string, title: string, checkout?: string): void;
   /** Walks you to the desk a pull request came from. */
   goToDesk(deskId: string): void;
   /** Put an issue on the 📋 task queue; a worker is seated for it when there's room. */
@@ -24,13 +27,25 @@ export interface BoardActions {
 }
 
 /** The task a worker gets for an issue, from the board, a carried card or the queue (the 'issue.work' prompt). */
-export function issuePrompt(it: Pick<GhIssue, 'number' | 'title'> & { url?: string }): string {
+export function issuePrompt(it: Pick<GhIssue, 'number' | 'title'> & { url?: string; repo?: string }): string {
   return officePrompt('issue.work', issueVars(it));
 }
 
-/** What an issue's prompts fill in. A carried card has no URL, but the board usually knows it. */
-export function issueVars(it: Pick<GhIssue, 'number' | 'title'> & { url?: string }) {
-  return { number: it.number, title: it.title, url: it.url ?? store.issues.items.find((i) => i.number === it.number)?.url ?? '' };
+/**
+ * What an issue's prompts fill in. A carried card has no URL, but the board usually knows it. On a
+ * floor with more than one repository (GhIssue.repo) the issue is named with its repository, as
+ * owner/name#12: the worker may be hired in another of them, and "closes #12" would be the wrong one.
+ */
+export function issueVars(it: Pick<GhIssue, 'number' | 'title'> & { url?: string; repo?: string }) {
+  const repo = it.repo && /^[\w.-]+\/[\w.-]+$/.test(it.repo) ? it.repo : undefined;
+  return {
+    number: it.number,
+    title: it.title,
+    // A carried card is always the floor's own repository's (see GhIssue.checkout).
+    url: it.url ?? store.issues.items.find((i) => i.number === it.number && !i.checkout)?.url ?? '',
+    ref: repo ? `${repo}#${it.number}` : `#${it.number}`,
+    repoFlag: repo ? ` --repo ${repo}` : '',
+  };
 }
 
 const TILTS = ['-1.2deg', '0.8deg', '-0.4deg', '1.4deg', '0deg', '-0.9deg'];
@@ -49,7 +64,7 @@ const byUpdated = (a: { updatedAt: string }, b: { updatedAt: string }) => b.upda
 
 function issueColumns(items: GhIssue[]): Column<GhIssue>[] {
   const open = items.filter((i) => i.state === 'OPEN');
-  const inProgress = open.filter((i) => i.assignees.length > 0 || i.labels.some((l) => /progress|doing|wip|started/i.test(l.name)) || store.taskForIssue(i.number)?.status === 'running');
+  const inProgress = open.filter((i) => i.assignees.length > 0 || i.labels.some((l) => /progress|doing|wip|started/i.test(l.name)) || (!i.checkout && store.taskForIssue(i.number)?.status === 'running'));
   const todo = open.filter((i) => !inProgress.includes(i));
   return [
     { key: 'open', title: '📥 Open', items: todo },
@@ -109,6 +124,11 @@ function labelChips(labels: GhLabel[]) {
 }
 
 const CHECK_ICON: Record<GhPull['checks'], string> = { pass: '🟢', fail: '🔴', pending: '🟡', none: '' };
+
+/** Which of the floor's repositories a card is in, on a floor with more than one (see GhIssue.repo). */
+function repoChip(it: { repo?: string }): Node | '' {
+  return it.repo ? h('span.repo-chip', { title: `In ${it.repo}` }, `📁 ${it.repo.split('/').pop()}`) : '';
+}
 
 /** A chip naming a worker and desk, color-coded to match the worker back on the floor. */
 function workerChip(w: WorkerInfo, title: string) {
@@ -282,7 +302,7 @@ export function openBoard(kind: 'issues' | 'pulls', net: Net, actions: BoardActi
       for (const col of issueColumns(store.issues.items)) {
         body.append(
           column(col, all, (it, i) =>
-            card(it.number, it.title, [...labelChips(it.labels), queueChip(it.number), it.assignees.length ? `👤 ${it.assignees.join(', ')}` : `by ${it.author}`, it.comments ? `💬 ${it.comments}` : '', timeAgo(it.updatedAt)], i, () => openIssue(it, net, actions), () => openLabels('issue', it, net)),
+            card(it.number, it.title, [repoChip(it), ...labelChips(it.labels), it.checkout ? '' : queueChip(it.number), it.assignees.length ? `👤 ${it.assignees.join(', ')}` : `by ${it.author}`, it.comments ? `💬 ${it.comments}` : '', timeAgo(it.updatedAt)], i, () => openIssue(it, net, actions), () => openLabels('issue', it, net)),
           ),
         );
       }
@@ -295,6 +315,7 @@ export function openBoard(kind: 'issues' | 'pulls', net: Net, actions: BoardActi
               it.number,
               it.title,
               [
+                repoChip(it),
                 w ? deskChip(w) : '',
                 ...labelChips(it.labels),
                 `by ${it.author}`,

@@ -3,7 +3,7 @@ import { ROOF, ROOF_NAME } from '../../shared/rooftop';
 import { store } from '../state';
 import type { Voice } from '../voice';
 import type { ChatLine } from '../../shared/protocol';
-import { $, h, openModal, STATUS_LABEL } from './dom';
+import { $, h, openModal, statusLabel } from './dom';
 import { usageLabel, usageTitle } from './usage';
 import { providerLabel, providerUsageState, resolvedProvider, modelBadge } from './provider';
 import { whereabouts } from './whereabouts';
@@ -66,7 +66,9 @@ export function renderWorkers(onOpen: (id: string) => void) {
     const usageState = w.kind === 'agent' ? providerUsageState(w.provider, store.project, w.usage) : undefined;
     const usageNote = usageState === 'untracked' ? ' · usage untracked' : usageState === 'waiting' && providerKind === 'opencode' ? ' · waiting for metrics' : usageState === 'waiting' && providerKind === 'codex' ? ' · waiting for first report' : '';
     const badge = w.kind === 'agent' ? modelBadge(w.provider, w.model, w.effort) : undefined;
-    const sub = [provider && `⚙️ ${provider}${badge ? ` · ${badge}` : ''}${usageNote}`, w.worktree && `🌿 ${w.worktree.branch}`, w.repos?.length && `🗂️ ${w.repos.length + 1} repos`, w.pr && `🔀 PR #${w.pr.number}`, w.activity || w.title || w.prompt].filter(Boolean).join(' · ');
+    // In one of the repositories linked to the floor rather than its own (see WorkerInfo.checkout).
+    const checkout = w.checkout && (store.currentFloor()?.links?.find((l) => l.id === w.checkout)?.name ?? w.checkout);
+    const sub = [provider && `⚙️ ${provider}${badge ? ` · ${badge}` : ''}${usageNote}`, checkout && `📁 ${checkout}`, w.worktree && `🌿 ${w.worktree.branch}`, w.repos?.length && `🗂️ ${w.repos.length + 1} repos`, w.pr && `🔀 PR #${w.pr.number}`, w.activity || w.title || w.prompt].filter(Boolean).join(' · ');
     ul.append(
       h(
         'li',
@@ -74,7 +76,7 @@ export function renderWorkers(onOpen: (id: string) => void) {
         h('span.dot', { style: `background:${w.color}` }),
         h('span.name', {}, w.name, sub ? h('span.sub', {}, sub) : null,
           usageState === 'tracked' && w.usage ? h('span.cost', { title: usageTitle(w.usage, providerKind) }, usageLabel(w.usage, providerKind)) : null),
-        h('span.pill', { class: w.status }, STATUS_LABEL[w.status] ?? w.status),
+        h('span.pill', { class: w.status }, statusLabel(w)),
       ),
     );
   }

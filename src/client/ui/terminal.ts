@@ -4,7 +4,8 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import type { Net } from '../net';
 import { store } from '../state';
 import { TERM_THEME } from '../world/laptop';
-import { h, openModal, STATUS_LABEL, timeAgo, toast, type Modal } from './dom';
+import { h, openModal, statusLabel, timeAgo, toast, type Modal } from './dom';
+import { confirmDialog } from './prompt';
 import { usageLabel, usageTitle } from './usage';
 import type { ServerMsg, WorkerInfo } from '../../shared/protocol';
 import { isAsleep } from '../../shared/status';
@@ -61,6 +62,21 @@ async function uploadDrop(workerId: string, f: File): Promise<string> {
   return r.path;
 }
 
+/**
+ * Asks before carrying a session from someone's terminal (WorkerInfo.external) on in the office:
+ * both would write to the one conversation while the terminal's Claude is still open.
+ */
+export function confirmTakeOver(net: Net, w: WorkerInfo) {
+  if (!w.external) return;
+  if (!store.me.admin) return toast(`${w.name} is running in a terminal on the office's machine — an admin can take it over`, 'warn');
+  confirmDialog(
+    `Take over ${w.name}?`,
+    `The office carries this conversation on itself, with claude --resume, at this desk. It's still open in your terminal (PID ${w.external.pid}): close it there, so the two don't both write to it. Nothing in your terminal is stopped for you.`,
+    '🖥️ Take over',
+    () => net.send({ t: 'worker.takeOver', workerId: w.id, force: true }),
+  );
+}
+
 let current: { workerId: string; modal: Modal; find(f: TerminalFind): void } | null = null;
 const listeners = new Set<(msg: ServerMsg) => void>();
 
@@ -101,9 +117,11 @@ export function openTerminal(net: Net, workerId: string, onChanges?: () => void,
     'aria-label': 'Send Esc to the terminal',
   }, '⎋ Esc');
   const changesBtn = h('button.btn', { type: 'button', title: 'What this worker changed: files, diff, commit, open a PR (C at the desk)' }, '🌿 Changes');
+  // A session in someone's own terminal: the office has no terminal of it until it's taken over.
+  const takeOverBtn = h('button.btn.primary.hidden', { type: 'button', title: 'Carry this conversation on in the office (R at the desk)' }, '🖥️ Take over');
   const closeBtn = h('button.btn.close', { title: 'Leave terminal (Esc or Ctrl+]) · ⎋ Esc or Ctrl+[ sends Esc to the terminal', 'aria-label': 'Close' }, '✕');
   const host = h('div.term-host', { 'data-drop': '📎 Drop screenshots or files here to put them in the terminal' });
-  const el = h('div.modal.term', { role: 'dialog', 'aria-label': `${info.name} terminal` }, h('header', {}, dot, title, pill, cost, viewers, typed, modelsBtn, escBtn, onChanges ? changesBtn : null, closeBtn), host);
+  const el = h('div.modal.term', { role: 'dialog', 'aria-label': `${info.name} terminal` }, h('header', {}, dot, title, pill, cost, viewers, typed, takeOverBtn, modelsBtn, escBtn, onChanges ? changesBtn : null, closeBtn), host);
 
   const term = new Terminal({
     fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
@@ -208,7 +226,8 @@ export function openTerminal(net: Net, workerId: string, onChanges?: () => void,
     }
     title.textContent = [w.kind === 'agent' ? providerLabel(w.provider, store.project) : null, w.name, w.title, w.worktree && `🌿 ${w.worktree.branch}`, w.repos?.length && `🗂️ ${[w.worktree?.path.split(/[\\/]/).pop(), ...w.repos.map((r) => r.name)].join(' + ')}`].filter(Boolean).join(' · ');
     pill.className = `pill ${w.status}`;
-    pill.textContent = STATUS_LABEL[w.status] ?? w.status;
+    pill.textContent = statusLabel(w);
+    takeOverBtn.classList.toggle('hidden', !w.external);
     const workerProvider = w.kind === 'agent' ? resolvedProvider(w.provider, store.project) : undefined;
     const usageState = w.kind === 'agent' ? providerUsageState(w.provider, store.project, w.usage) : undefined;
     cost.textContent = w.kind !== 'agent' ? '' : usageState === 'tracked' && w.usage ? usageLabel(w.usage, workerProvider) : workerProvider === 'opencode' && usageState === 'waiting' ? 'waiting for metrics' : workerProvider === 'codex' && usageState === 'waiting' ? 'waiting for first report' : usageState === 'untracked' ? 'usage untracked' : '';
@@ -311,6 +330,10 @@ export function openTerminal(net: Net, workerId: string, onChanges?: () => void,
   changesBtn.addEventListener('click', () => {
     onChanges?.();
     modal.close();
+  });
+  takeOverBtn.addEventListener('click', () => {
+    const w = store.workers.get(workerId);
+    if (w) confirmTakeOver(net, w);
   });
 
   term.open(host);

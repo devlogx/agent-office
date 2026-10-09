@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { OutlineEffect } from 'three/examples/jsm/effects/OutlineEffect.js';
 import { sameLook } from '../shared/avatar';
 import { BALCONY, DESK_BY_ID, DESKS, ELEVATOR, ELEVATOR_CAR, FLOOR, GOLF_HOLE, LADDER, LOFT, POLE, POLES, SEATING_BY_ID, SLAB, STATIONS, STATION_AGENT, STOREY, WALL_HEIGHT, beanbagsOut, deskSeat, inElevator, nextFreeSeat, roofDrop, seatAt, seatPlace, streetBelow, vacantSeats, type DeskDef, type SeatDef, type SeatPlace, type StationKind } from '../shared/layout';
-import { floorPalette } from '../shared/floors';
+import { floorPalette, repoKey } from '../shared/floors';
 import type { AgentEffort, AgentProvider, CarriedIssue, FloorInfo, GhIssue, GongWhy, PeerInfo, WorkerInfo, WorkerTask } from '../shared/protocol';
 import { MEETING_PATTERNS } from '../shared/meetings';
 import { isAsleep, isBusy, workerPr } from '../shared/status';
@@ -42,12 +42,12 @@ import { Voice } from './voice';
 import { OfficeSound } from './sound';
 import { DesktopNotifier, askNotifyPermission, notifyPermission, waitingOnSomeone } from './notify';
 import { NextUp, waitingInOrder, waitingLabel } from './nextup';
-import { $, h, clip, closeAllModals, doingNow, modalOpen, onDoingChange, onModalChange, openModal, readingNow, toast, STATUS_LABEL } from './ui/dom';
-import { openTerminal, openTerminalFor, routeTerminalMessage, type TerminalFind } from './ui/terminal';
+import { $, h, clip, closeAllModals, doingNow, modalOpen, onDoingChange, onModalChange, openModal, readingNow, toast, STATUS_LABEL, statusLabel } from './ui/dom';
+import { confirmTakeOver, openTerminal, openTerminalFor, routeTerminalMessage, type TerminalFind } from './ui/terminal';
 import { openSearch } from './ui/search';
 import { openChanges, openChangesFor, routeChangesMessage } from './ui/changes';
 import { openRepoPulls, workerRepos } from './ui/repos';
-import { openPrompt, confirmDialog, sendHomeDialog, routeWorktreeMessage, worktreePref } from './ui/prompt';
+import { openPrompt, confirmDialog, sendHomeDialog, routeWorktreeMessage, worktreePref, type CheckoutChoice } from './ui/prompt';
 import { issuePrompt, openBoard } from './ui/boards';
 import { openIssue, openPull, routePullMessage } from './ui/pull';
 import { openAsk } from './ui/ask';
@@ -182,7 +182,10 @@ function offBoard(): Set<number> {
 const issuesTex = new BoardTexture('issues');
 const renderIssuesBoard = () => {
   const off = offBoard();
-  issuesTex.render(off.size ? { ...store.issues, items: store.issues.items.filter((i) => !off.has(i.number)) } : store.issues);
+  // The notes on the cork board are the floor's own repository's: a card is carried by its number
+  // alone, and the other repositories' are on the board's window (see GhIssue.checkout).
+  const own = store.issues.items.some((i) => i.checkout) ? store.issues.items.filter((i) => !i.checkout) : store.issues.items;
+  issuesTex.render(off.size || own !== store.issues.items ? { ...store.issues, items: own.filter((i) => !off.has(i.number)) } : store.issues);
 };
 mountBoard(office.boardMeshes.issues, issuesTex.texture, renderIssuesBoard, ['issues']);
 let carriedOff = '';
@@ -928,7 +931,7 @@ net.onMessage((msg) => {
       theirToss(msg.id, { game: msg.game, u: msg.u, v: msg.v, stick: msg.stick, n: msg.n });
       break;
     case 'gong':
-      gongRang(msg.why, msg.pr);
+      gongRang(msg.why, msg.pr, msg.checkout);
       break;
     case 'horn':
       if (!upTop) break;
@@ -1478,7 +1481,7 @@ function syncWorkers() {
     // Keys clack while it types, not while it reads, watches its tests or browses.
     if (deskDef) sound.setTyping(w.id, deskDef.x, deskDef.z, w.status === 'working' && (!w.action || w.action === 'edit'));
     const again = w.kind === 'shell' ? 'restart' : 'resume';
-    v.laptop.setPlaceholder(w.status === 'offline' ? `💤 ${w.name} is asleep — press R to ${again}` : w.status === 'exited' ? `${w.name} exited` : 'booting…');
+    v.laptop.setPlaceholder(w.external ? '🖥️ In your terminal — press R to take it over' : w.status === 'offline' ? `💤 ${w.name} is asleep — press R to ${again}` : w.status === 'exited' ? `${w.name} exited` : 'booting…');
   }
   for (const [id, v] of workerViews) {
     if (store.workers.has(id)) continue;
@@ -1600,8 +1603,8 @@ function officeIsFull(): boolean {
   return true;
 }
 
-function hire(deskId: string, prompt?: string, worktree = false, provider?: AgentProvider, model?: string, effort?: AgentEffort, issue?: number, repos?: string[]) {
-  net.send({ t: 'worker.spawn', deskId, prompt, worktree, provider, model, effort, issue, repos: repos?.length ? repos : undefined });
+function hire(deskId: string, prompt?: string, worktree = false, provider?: AgentProvider, model?: string, effort?: AgentEffort, issue?: number, repos?: string[], checkout?: string) {
+  net.send({ t: 'worker.spawn', deskId, prompt, worktree, provider, model, effort, issue, repos: repos?.length ? repos : undefined, checkout });
   // The moment notifications start to matter: ask once (it has to come from a key press or click).
   if (settings.notify && notifyPermission() === 'default' && !askedToNotify) {
     askedToNotify = true;
@@ -1609,9 +1612,25 @@ function hire(deskId: string, prompt?: string, worktree = false, provider?: Agen
   }
 }
 
-/** The building's other projects a new worker can work in too, each in a worktree of its own (see WorkerInfo.repos). */
+/**
+ * The building's other projects a new worker can work in too, each in a worktree of its own (see
+ * WorkerInfo.repos), by repoKey: this floor's other checkouts first (the hire dialog leaves out the
+ * one it's hired in), then every other floor's, and the ones linked to those.
+ */
 function repoChoices(): { id: string; name: string }[] {
-  return store.floors.filter((f) => f.id !== store.floor && f.branch && !f.cloning).map((f) => ({ id: f.id, name: f.name }));
+  const here = store.floors.find((f) => f.id === store.floor);
+  const own = here?.links?.length ? [{ id: here.id, name: here.name }, ...here.links.map((l) => ({ id: repoKey({ floor: here.id, checkout: l.id }), name: l.name }))] : [];
+  const others = store.floors
+    .filter((f) => f.id !== store.floor && f.branch && !f.cloning)
+    .flatMap((f) => [{ id: f.id, name: f.name }, ...(f.links ?? []).map((l) => ({ id: repoKey({ floor: f.id, checkout: l.id }), name: `${l.name} (${f.name})` }))]);
+  return [...own, ...others];
+}
+
+/** On a floor with more than one repository, the ones a new worker can be hired in: the floor's own, then each linked one (see WorkerInfo.checkout). */
+function checkoutChoices(): CheckoutChoice[] | undefined {
+  const here = store.floors.find((f) => f.id === store.floor);
+  if (!here?.links?.length) return undefined;
+  return [{ id: '', name: here.name, key: here.id }, ...here.links.map((l) => ({ id: l.id, name: l.name, key: repoKey({ floor: here.id, checkout: l.id }) }))];
 }
 
 function openShell(deskId: string) {
@@ -1632,8 +1651,11 @@ function promptAtDesk(deskId: string) {
       providerOption: true,
       worktreeOption: !!store.project?.branch,
       repoOptions: repoChoices(),
-      onSubmit: (text, o) => hire(deskId, text, o.worktree, o.provider, o.model, o.effort, undefined, o.repos),
+      checkoutOptions: checkoutChoices(),
+      onSubmit: (text, o) => hire(deskId, text, o.worktree, o.provider, o.model, o.effort, undefined, o.repos, o.checkout),
     });
+  } else if (w.external) {
+    toast(`${w.name} is running in your terminal — prompt it there, or press R to take it over`, 'warn');
   } else if (isAsleep(w.status)) {
     toast(`${w.name} is asleep — press R to resume first`, 'warn');
   } else if (w.kind === 'shell') {
@@ -1666,7 +1688,8 @@ function hireAtDesk(deskId: string) {
     providerOption: true,
     worktreeOption: !!store.project?.branch,
     repoOptions: repoChoices(),
-    onSubmit: (text, o) => hire(deskId, text || undefined, o.worktree, o.provider, o.model, o.effort, undefined, o.repos),
+    checkoutOptions: checkoutChoices(),
+    onSubmit: (text, o) => hire(deskId, text || undefined, o.worktree, o.provider, o.model, o.effort, undefined, o.repos, o.checkout),
   });
 }
 
@@ -1675,6 +1698,17 @@ function killWorker(id: string) {
   if (!w) return;
   const where = DESK_BY_ID.get(w.deskId)?.label ?? 'the desk';
   const session = w.kind === 'shell' ? 'shared shell' : `${providerLabel(w.provider, store.project)} session`;
+  // Its repository is off the floor: nothing can look at its worktree, so an admin can only forget it.
+  if (w.checkout && !store.currentFloor()?.links?.some((l) => l.id === w.checkout)) {
+    if (!store.me.admin) return toast(`${w.name} works in a repository that isn't on this floor any more — add it back to carry on`, 'warn');
+    confirmDialog(
+      `Forget ${w.name}?`,
+      `Its repository isn't on this floor any more, so its worktree and branch can't be checked: they're left where they are, for agent-office prune to tidy up. Adding the repository back instead brings ${w.name} back to work.`,
+      'Forget it',
+      () => net.send({ t: 'worker.kill', workerId: id, forget: true }),
+    );
+    return;
+  }
   if (w.meeting) {
     // The meeting's worktree is the whole table's: it's tidied away once they've all gone.
     const m = store.meeting.current;
@@ -1693,6 +1727,10 @@ function killWorker(id: string) {
       ask: () => net.send({ t: 'worker.worktree', workerId: id }),
       onConfirm: (cleanup) => net.send({ t: 'worker.kill', workerId: id, cleanup }),
     });
+    return;
+  }
+  if (w.external) {
+    confirmDialog(`Take ${w.name} off its desk?`, `It's a Claude session in your terminal: it carries on there, untouched, and doesn't come back to a desk while it runs.`, 'Send home', () => net.send({ t: 'worker.kill', workerId: id }));
     return;
   }
   const body = DESK_BY_ID.get(w.deskId)?.station
@@ -1733,6 +1771,8 @@ function askStation(deskId: string) {
 }
 
 function resumeWorker(w: WorkerInfo) {
+  // In someone's own terminal: R carries it on here instead, once they say so.
+  if (w.external) return confirmTakeOver(net, w);
   if (!w.sessionId && w.kind !== 'shell') toast(`${w.name} has no saved Claude session — starting a fresh one`, 'warn');
   net.send({ t: 'worker.resume', workerId: w.id });
 }
@@ -1746,7 +1786,8 @@ function prReady(w: WorkerInfo) {
 function pullRequestFor(w: WorkerInfo) {
   if (w.repos?.length) return pullRequestsFor(w);
   if (w.pr) {
-    const it = store.pulls.items.find((p) => p.number === w.pr!.number);
+    // In the repository it works in: numbers are only unique within one.
+    const it = store.pulls.items.find((p) => p.number === w.pr!.number && p.checkout === w.checkout);
     if (it) openPull(it, net, boardActions());
     else window.open(w.pr.url, '_blank', 'noopener');
     return;
@@ -1774,7 +1815,8 @@ function pullRequestsFor(w: WorkerInfo) {
   if (!workerRepos(w).some((r) => r.pr)) return open();
   openRepoPulls(w.id, {
     openPull: (number, url) => {
-      const it = store.pulls.items.find((p) => p.number === number);
+      // By its URL: on a floor with more than one repository, numbers are only unique within one.
+      const it = store.pulls.items.find((p) => p.url === url);
       if (it) openPull(it, net, boardActions());
       else window.open(url, '_blank', 'noopener');
     },
@@ -1879,7 +1921,8 @@ function pointToWaiting(now: number) {
 function openWorkerTerminal(id: string, find?: TerminalFind) {
   const w = store.workers.get(id);
   if (!w) return;
-  if (isAsleep(w.status)) resumeWorker(w);
+  // Not one in someone's terminal, though: that only moves in with Take over.
+  if (isAsleep(w.status) && !w.external) resumeWorker(w);
   openTerminal(net, id, () => openWorkerChanges(id), find);
 }
 
@@ -1939,8 +1982,11 @@ function turnPage() {
   rustledAt = now;
 }
 
-/** A prompt from the boards goes to a new worker at a free desk, or to one already at a desk. */
-function sendToWorker(title: string, text: { context?: string; initial?: string }) {
+/**
+ * A prompt from the boards goes to a new worker at a free desk, or to one already at a desk. `checkout`
+ * is the repository the issue or PR is in, when it's one linked to the floor: a new worker starts there.
+ */
+function sendToWorker(title: string, text: { context?: string; initial?: string }, checkout?: string) {
   const desk = freeDesk();
   const awake = [...store.workers.values()].filter((w) => w.kind === 'agent' && !isAsleep(w.status));
   if (!desk && !awake.length) {
@@ -1955,9 +2001,11 @@ function sendToWorker(title: string, text: { context?: string; initial?: string 
     worktreeOption: !!store.project?.branch,
     providerOption: true,
     repoOptions: repoChoices(),
-    onSubmit: (prompt, to, worktree, provider, model, effort, repos) => {
+    checkoutOptions: checkoutChoices(),
+    checkout,
+    onSubmit: (prompt, to, worktree, provider, model, effort, repos, at) => {
       if (to) net.send({ t: 'worker.prompt', workerId: to, prompt });
-      else if (desk) hire(desk, prompt, worktree, provider, model, effort, undefined, repos);
+      else if (desk) hire(desk, prompt, worktree, provider, model, effort, undefined, repos, at);
     },
   });
 }
@@ -1965,8 +2013,8 @@ function sendToWorker(title: string, text: { context?: string; initial?: string 
 function boardActions() {
   return {
     queue: (prompt: string, title: string, issue: number, provider?: AgentProvider, model?: string, effort?: AgentEffort) => net.send({ t: 'queue.add', prompt, title, issue, provider, model, effort }),
-    assign: (prompt: string, title: string) => sendToWorker(`🤖 ${title}`, { initial: prompt }),
-    ask: (context: string, title: string) => sendToWorker(`✍️ ${title}`, { context }),
+    assign: (prompt: string, title: string, checkout?: string) => sendToWorker(`🤖 ${title}`, { initial: prompt }, checkout),
+    ask: (context: string, title: string, checkout?: string) => sendToWorker(`✍️ ${title}`, { context }, checkout),
     meeting: (preset: MeetingPreset) => showMeeting(preset),
     goToDesk,
     pickUp,
@@ -2466,6 +2514,7 @@ function onQueue(issue: number): boolean {
 /** Why the worker at a desk can't be handed an issue card right now, or '' when it can. */
 function cantTakeCard(w: WorkerInfo): string {
   if (w.kind === 'shell') return `${w.name} is a shell, not an agent`;
+  if (w.external) return `${w.name} is running in your terminal — press R to take it over first`;
   if (isAsleep(w.status)) return `${w.name} is asleep — press R to resume first`;
   if (w.status === 'needs_input') return `${w.name} is waiting on an answer — open the terminal first`;
   return '';
@@ -2584,7 +2633,7 @@ const CONFETTI_DENSITY = 3.5;
 const floorArea = (a: Area) => (a.maxX - a.minX) * (a.maxZ - a.minZ);
 
 /** Someone hit the gong, a pull request merged (a dance party under a confetti rain), or the queue emptied (a party). */
-function gongRang(why: GongWhy, pr?: number) {
+function gongRang(why: GongWhy, pr?: number, checkout?: string) {
   office.gong.strike(why === 'hit' ? 0.7 : 1);
   sound.gong(why);
   const top = office.gong.top;
@@ -2592,8 +2641,9 @@ function gongRang(why: GongWhy, pr?: number) {
     // Confetti rains down all over the floor, and pops over the desk the PR came from while its worker's still there.
     confetti.rain(FLOOR, floorArea(FLOOR) * CONFETTI_DENSITY, 3, ceilingOver);
     confetti.rain(LOFT, floorArea(LOFT) * CONFETTI_DENSITY, 3, () => LOFT.y + LOFT.height - 0.1);
-    const it = store.pulls.items.find((p) => p.number === pr);
-    const w = pr === undefined ? undefined : workerForPull(store.workers.values(), it ?? { number: pr, headRefName: '' });
+    // In the repository it merged in: numbers are only unique within one.
+    const it = store.pulls.items.find((p) => p.number === pr && p.checkout === checkout);
+    const w = pr === undefined ? undefined : workerForPull(store.workers.values(), it ?? { number: pr, headRefName: '', checkout });
     if (w && workerViews.has(w.id)) burstOver(w.deskId, 220);
     else confetti.burst(top.x, top.y, top.z, 220);
     danceParty();
@@ -2871,14 +2921,14 @@ function deskHint(deskId: string): Hint {
   const spent = w.kind === 'agent' && w.usage ? usageLabel(w.usage, workerProvider) : '';
   const shell = w.kind === 'shell';
   return {
-    k: w.status + w.id + (w.pr?.number ?? '') + (w.repos?.map((r) => r.pr?.number ?? '-').join() ?? '') + (w.prOpening ? '!' : '') + doing + spent,
+    k: w.status + w.id + (w.external ? '🖥️' : '') + (w.pr?.number ?? '') + (w.repos?.map((r) => r.pr?.number ?? '-').join() ?? '') + (w.prOpening ? '!' : '') + doing + spent,
     parts: [
-      h('span.title', {}, `${w.name} · ${STATUS_LABEL[w.status]}`),
+      h('span.title', {}, `${w.name} · ${statusLabel(w)}`),
       doing ? aside(doing) : '',
       spent ? h('span.cost', { title: usageTitle(w.usage!, workerProvider) }, spent) : '',
-      key('E', 'Open terminal'),
+      key('E', w.external ? 'Look' : 'Open terminal'),
       key('C', 'Changes'),
-      isAsleep(w.status) ? key('R', shell ? 'Restart' : 'Resume') : key('P', shell ? 'Run command' : 'Prompt'),
+      w.external ? key('R', 'Take over') : isAsleep(w.status) ? key('R', shell ? 'Restart' : 'Resume') : key('P', shell ? 'Run command' : 'Prompt'),
       w.repos?.length ? reposKey(w) : w.pr ? key('O', `PR #${w.pr.number}`) : w.prOpening ? aside('⏳ Opening PR…') : prReady(w) ? key('O', 'Open PR') : '',
       key('X', 'Send home'),
     ],
@@ -3308,7 +3358,7 @@ function aimedAt(ndc: THREE.Vector2, slack = 0): { it: Interactable; near: boole
 function noteUnder(aim: { it: Interactable; hit: THREE.Intersection } | null): GhIssue | null {
   if (aim?.it.kind !== 'issues' || aim.hit.object !== office.boardMeshes.issues || !aim.hit.uv) return null;
   const n = issuesTex.noteAt(aim.hit.uv);
-  return n === undefined ? null : (store.issues.items.find((i) => i.number === n) ?? null);
+  return n === undefined ? null : (store.issues.items.find((i) => i.number === n && !i.checkout) ?? null);
 }
 
 /** The note on the issues board under the crosshair (or, in third person, the mouse), which E takes. */

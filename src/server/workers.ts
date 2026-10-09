@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync, accessSync, chmodSync, mkdirSync, readdirSync, rmdirSync, unlinkSync, constants } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, writeFileSync, accessSync, chmodSync, mkdirSync, readdirSync, rmdirSync, unlinkSync, constants } from 'node:fs';
 import { execFile, execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { homedir } from 'node:os';
@@ -11,8 +11,8 @@ import type { AgentChoice, AgentEffort, AgentProvider, Run, TerminalHit, WorkerI
 import { FAILS_TO_DESPAIR, outputFailed, toolAction } from '../shared/actions.js';
 import { FLAG_BOLD, FLAG_DIM, FLAG_INVERSE, RGB_FLAG, isAgentEffort, isClaudeModel } from '../shared/protocol.js';
 import { WORKSPACE_FILES, WORKTREES_DIR, Worktrees, describeWork, workspaceOf, type WorktreeCleanup, type WorktreeRef, type WorktreeState } from './worktrees.js';
-import { normalizeRepo } from '../shared/floors.js';
-import { DESK_BY_ID, STATION_AGENT } from '../shared/layout.js';
+import { normalizeRepo, repoKey, sameRepo, splitRepoKey } from '../shared/floors.js';
+import { DESK_BY_ID, STATION_AGENT, nextFreeSeat } from '../shared/layout.js';
 import { QUEUE_AGENT_DISALLOWED_TOOLS, stationBrief } from './stations.js';
 import { officePrompt, type PromptSource } from './prompts.js';
 import { isBusy } from '../shared/status.js';
@@ -30,6 +30,7 @@ import { ScrollbackStore, searchTerminal, terminalTail } from './history.js';
 import { DropStore } from './drops.js';
 import { screenSnapshot } from './screen.js';
 import type { Capacity } from './machine.js';
+import { claudeConfigDir, descendsFrom, liveClaudeSessions, realProcesses, sameProcess, sessionTitle, type LiveSession, type ProcessProbe } from './sessions.js';
 
 type HeadlessTerminal = InstanceType<typeof headless.Terminal>;
 type Worktree = NonNullable<WorkerInfo['worktree']>;
@@ -82,6 +83,11 @@ const USAGE_SCAN_MS = 10_000;
 /** How often a terminal with new output is saved to disk, so even a crash loses at most this much. */
 const SAVE_SCROLLBACK_MS = 15_000;
 /** Between a worker's saved scrollback and what it prints after the office restarted. */
+/** What a worker for a session in someone's terminal is called when nobody has typed anything into it yet. */
+const TERMINAL_NAME = 'Terminal session';
+const TERMINAL_NAME_MAX = 40;
+/** How long a worker's last terminal's process (and what ran under it) still counts as the office's once it's gone. */
+const LAST_PTY_MS = 30_000;
 const RESTORED_NOTE = '\x1b[2m──── the office restarted · earlier output above ────\x1b[0m\r\n';
 /**
  * What a worker whose terminal didn't make it through a restart (the machine rebooted, the terminal
@@ -98,12 +104,50 @@ export interface HookEnv {
 /** Another floor's repository for a worker to work in too (see WorkerInfo.repos). */
 export interface RepoSource {
   floor: string;
+  /** One of that floor's linked checkouts (see LinkedCheckout) rather than its own; that floor can be this one. */
+  checkout?: string;
   /** The floor's name, for messages. */
   name: string;
   /** owner/name on GitHub, when known. */
   repo?: string;
   /** Its checkout. */
   dir: string;
+}
+
+/**
+ * Another repository's checkout on this floor besides its own (see FloorLink): workers can be hired in
+ * it (WorkerInfo.checkout), and Claude sessions in a terminal there are seated here too.
+ */
+export interface LinkedCheckout {
+  id: string;
+  name: string;
+  repo?: string;
+  dir: string;
+}
+
+/** A checkout a worker works in, git plumbing for it, and a worktree of the worker's in its terms (see home). */
+interface Home {
+  dir: string;
+  trees: Worktrees;
+  /** A worktree whose path is relative to the floor's dir, where it lives, with that path relative to this checkout instead. */
+  ref<T extends { path?: string }>(wt: T): T;
+}
+
+/**
+ * The repositories a new worker works in too (see WorkerInfo.repos), from their repoKeys: `own` is
+ * the one it's hired in, and `find` looks a checkout up as the building has it now (a floor's, or a
+ * link's). Why not, when one is its own or is no longer in the building.
+ */
+export function repoSources(keys: string[], own: string, find: (at: { floor: string; checkout?: string }) => { name: string; repo?: string; dir: string } | undefined): RepoSource[] | string {
+  const found: RepoSource[] = [];
+  for (const key of keys) {
+    if (key === own) return "The worker's own project is already in its workspace";
+    const at = splitRepoKey(key);
+    const there = find(at);
+    if (!there) return 'That project is no longer in the building';
+    found.push({ floor: at.floor, checkout: at.checkout, name: there.name, repo: there.repo, dir: there.dir });
+  }
+  return found;
 }
 
 /** A pull request 'worker.pr' opened, or found already open, for a worker's branch. */
@@ -169,13 +213,31 @@ interface Worker {
   tracker: UsageTracker;
   scanTimer?: NodeJS.Timeout;
   /** Its terminal in the host as of the last save, and how it was doing, to pick back up after a restart. */
-  saved?: { ptyId: string; status: WorkerStatus; acked: boolean; waitingSince?: number };
+  saved?: { ptyId: string; pid?: number; status: WorkerStatus; acked: boolean; waitingSince?: number };
   /** Its process went away mid-turn with the office or the terminal host: its next start carries on (CARRY_ON_PROMPT). */
   interrupted?: boolean;
   /** Output since its scrollback was last saved to disk. */
   unsaved?: boolean;
   /** Where this run's own output starts, below the scrollback carried over from before. */
   fresh?: { readonly line: number };
+  /**
+   * It came from a Claude session in someone's terminal (WorkerInfo.external): the folder that session
+   * ran in, which it carries on in (Claude keeps a conversation under the folder it ran in, so
+   * --resume only finds it from there), and when that terminal's process started, to tell it from a
+   * later process with the same pid.
+   */
+  terminal?: { cwd: string; procStart?: string };
+  /** Its terminal session ended on its own: it sleeps until someone wakes it (R, a prompt), not with wakeAll. */
+  noWake?: boolean;
+  /** Its last terminal's process, and when it went: the office's own for a little while after (see ours). */
+  lastPty?: { pid: number; at: number };
+  /** The name of the linked checkout it works in (WorkerInfo.checkout), for saying so once the floor no longer has it (see stranded). */
+  checkoutName?: string;
+  /**
+   * Which repository that linked checkout is: its folder with symlinks resolved, and its origin. A
+   * link by the same id that's another repository isn't this worker's (see linkOf).
+   */
+  checkoutAt?: { dir: string; repo?: string };
 }
 
 export interface WorkerEvents {
@@ -210,6 +272,18 @@ export class WorkerManager {
   private scrollback: ScrollbackStore;
   private drops: DropStore;
   private saveTimer: NodeJS.Timeout;
+  /**
+   * The terminal sessions (by their Claude process) that aren't to come back as workers while they
+   * run: sent home from their desk, or taken over by the office (see syncTerminals). Kept in memory:
+   * a restarted office shows them again.
+   */
+  private dismissed = new Set<number>();
+  /** This floor's checkouts, as given and with their symlinks resolved, as the sessions' folders are (see roots). */
+  private rootCache?: { checkout?: string; dirs: string[] }[];
+  /** Git plumbing for each linked checkout, by its id: it keeps when it last fetched. */
+  private linkTrees = new Map<string, Worktrees>();
+  /** Whether a Claude process runs under one of this floor's terminals, by pid, and which terminals those were (`of`). */
+  private underUs = new Map<number, { under: boolean; of: string }>();
 
   constructor(
     private dir: string,
@@ -225,6 +299,10 @@ export class WorkerManager {
     private prompts?: PromptSource,
     /** Everyone's own sign-ins, for workers hired by an account. */
     private runAs?: RunAs,
+    /** How processes outside the office are looked at (see sessions.ts); tests stand one in. */
+    private probe: ProcessProbe = realProcesses,
+    /** The other repositories' checkouts on this floor (see setLinks). */
+    private links: LinkedCheckout[] = [],
   ) {
     this.defaultProvider = configuredProvider(agentCmd);
     this.trees = new Worktrees(dir);
@@ -270,14 +348,17 @@ export class WorkerManager {
     await this.host.connect();
     await Promise.all(
       [...this.workers.values()].map(async (w) => {
+        // Its repository isn't on the floor: its terminal waits in the host until it's back (see setLinks).
+        if (this.stranded(w.info.id)) return;
         const saved = w.saved;
         w.saved = undefined;
         const adopted = saved && (await this.host.attach(saved.ptyId));
         if (adopted) this.adopt(w, adopted, saved);
       }),
     );
-    // Terminals nobody saved a claim on (their worker was sent home as the office went down).
-    this.host.killUnclaimed();
+    // Terminals nobody saved a claim on (their worker was sent home as the office went down), but
+    // not those of workers whose repository is off the floor for now.
+    this.host.killUnclaimed(new Set([...this.workers.values()].flatMap((w) => (w.saved ? [w.saved.ptyId] : []))));
     this.wakeAll();
     // It may have switched branches while the office was down, its terminal still going.
     void this.syncBranches();
@@ -311,19 +392,136 @@ export class WorkerManager {
   owners(): ServiceOwner[] {
     return [...this.workers.values()].map((w) => ({
       workerId: w.info.id,
-      pid: w.pty?.pid,
+      // A session in someone's terminal: its own Claude process, whose servers they are.
+      pid: w.pty?.pid ?? w.info.external?.pid,
       agent: w.info.kind === 'agent',
       cwd: this.cwd(w.info),
-      root: this.dir,
+      // A worktree lives in this floor's checkout, whichever repository it's of.
+      root: workspaceOf(w.info) ? this.dir : this.homeDir(w.info),
     }));
+  }
+
+  /** The other repositories' checkouts on this floor changed (one was linked, or unlinked). */
+  setLinks(links: LinkedCheckout[]) {
+    const stranded = [...this.workers.values()].filter((w) => this.stranded(w.info.id));
+    this.links = links;
+    this.rootCache = undefined;
+    for (const id of this.linkTrees.keys()) if (!links.some((l) => l.id === id)) this.linkTrees.delete(id);
+    // Its repository is back on the floor: so is the worker, terminal and all, as after a restart.
+    for (const w of stranded) {
+      // The same repository, linked again by another name: it works in that one now.
+      const again = !this.linkOf(w) && w.checkoutAt && links.find((l) => sameCheckout(l, w.checkoutAt));
+      if (again) {
+        w.info.checkout = again.id;
+        w.checkoutName = again.name;
+      }
+      if (this.stranded(w.info.id)) continue;
+      w.info.activity = undefined;
+      const saved = w.saved;
+      w.saved = undefined;
+      void (async () => {
+        const adopted = saved && (await this.host.attach(saved.ptyId));
+        if (this.workers.get(w.info.id) !== w) return;
+        if (adopted) this.adopt(w, adopted, saved);
+        else if (!w.noWake && !w.info.external) this.resume(w.info.id);
+        else this.emitUpdate(w);
+        this.persist();
+      })();
+    }
+  }
+
+  /**
+   * Why a worker can't do anything right now: it works in a linked checkout the floor no longer has
+   * (WorkerInfo.checkout; the floor was taken off and added back without it, or floors.json was
+   * edited). It stays at its desk, with its worktree and its terminal (kept in the host), and isn't
+   * resumed, woken, sent home or cleaned up until that repository is on the floor again.
+   */
+  stranded(id: string): string | undefined {
+    const w = this.workers.get(id);
+    const checkout = w?.info.checkout;
+    if (!w || !checkout || this.linkOf(w)) return undefined;
+    return `${w.info.name} works in ${w.checkoutName ?? checkout}, which isn't on this floor any more — add it back to carry on`;
+  }
+
+  /**
+   * The linked checkout a worker works in, as the floor has it now: by its id, and only while that's
+   * still the same repository (see Worker.checkoutAt). Undefined for one in the floor's own checkout.
+   */
+  private linkOf(w: Worker): LinkedCheckout | undefined {
+    const link = w.info.checkout ? this.links.find((l) => l.id === w.info.checkout) : undefined;
+    if (!link || !sameCheckout(link, w.checkoutAt)) return undefined;
+    // Known from now on, so a different repository under this id later isn't taken for it.
+    w.checkoutAt ??= { dir: realDir(link.dir), repo: link.repo };
+    w.checkoutName = link.name;
+    return link;
+  }
+
+  /**
+   * Sends home a worker whose repository is off the floor (see stranded), forgetting it: nothing in git
+   * is touched, so its worktree and branch stay where they are, for `agent-office prune` to tidy up.
+   * Its terminal, kept in the host until now, ends. Returns a line for the team, or why it can't.
+   */
+  forget(id: string): { note: string } | string {
+    const w = this.workers.get(id);
+    if (!w) return 'No such worker';
+    if (!this.stranded(id)) return `${w.info.name} isn't missing its repository — send it home as usual`;
+    this.workers.delete(id);
+    this.namer.forget(id);
+    clearTimeout(w.scanTimer);
+    if (w.saved) this.host.killUnclaimed(undefined, w.saved.ptyId);
+    w.saved = undefined;
+    w.term?.dispose();
+    this.scrollback.remove(id);
+    this.drops.remove(id);
+    this.events.remove(id);
+    this.persist();
+    const { name, worktree } = w.info;
+    if (!worktree) return { note: `Forgot ${name}` };
+    const repo = w.checkoutAt?.dir ?? w.checkoutName ?? w.info.checkout;
+    return { note: `Forgot ${name}: its worktree ${path.join(this.dir, workspaceOf(w.info) ?? worktree.path)} and branch ${worktree.branch} are still there — run agent-office prune in ${this.dir} and in ${repo} to tidy them up` };
+  }
+
+  /**
+   * The workers working in a linked checkout (WorkerInfo.checkout), by name: it can't be unlinked
+   * while there are any. Workers with a worktree of it in their workspace are in WorkerInfo.repos.
+   */
+  onCheckout(linkId: string): string[] {
+    return [...this.workers.values()].filter((w) => w.info.checkout === linkId && this.linkOf(w)).map((w) => w.info.name);
+  }
+
+  /**
+   * The checkout a worker works in: one linked to this floor (WorkerInfo.checkout), or the floor's own.
+   * Its worktree is kept in the floor's .agent-office/worktrees either way, so `ref` puts its path in
+   * that checkout's terms for the git plumbing.
+   */
+  private home(info: { id?: string; checkout?: string }): Home | string {
+    if (!info.checkout) return { dir: this.dir, trees: this.trees, ref: (wt) => wt };
+    // A worker's: only while that id is still its repository (see linkOf).
+    const w = info.id ? this.workers.get(info.id) : undefined;
+    const link = w ? this.linkOf(w) : this.links.find((l) => l.id === info.checkout);
+    // Never the floor's own instead: its worktrees and branches aren't this worker's.
+    if (!link) return `${info.checkout} isn't on this floor any more`;
+    let trees = this.linkTrees.get(link.id);
+    if (!trees) {
+      trees = new Worktrees(link.dir);
+      this.linkTrees.set(link.id, trees);
+    }
+    return { dir: link.dir, trees, ref: (wt) => (wt.path ? { ...wt, path: path.relative(link.dir, path.join(this.dir, wt.path)) } : wt) };
+  }
+
+  /** The folder of the checkout a worker works in, or the floor's own when it's one the floor no longer has (see stranded). */
+  private homeDir(info: { id?: string; checkout?: string }): string {
+    const own = this.home(info);
+    return typeof own === 'string' ? this.dir : own.dir;
   }
 
   /**
    * Fetches the branch the project is on, so a worktree made next starts from what's on GitHub now
    * (see Worktrees.fetch). Undefined when there's nothing to wait for.
    */
-  fetchBase(): Promise<void> | undefined {
-    return this.trees.fetch();
+  fetchBase(checkout?: string): Promise<void> | undefined {
+    const own = this.home({ checkout });
+    return typeof own === 'string' ? undefined : own.trees.fetch();
   }
 
   deskOccupied(deskId: string): boolean {
@@ -334,9 +532,11 @@ export class WorkerManager {
   /**
    * Hires a worker at a desk. `meeting` seats one at the meeting room's table instead, for that meeting
    * (see meetings.ts), in the meeting's own worktree, which everyone at the table shares. `repos` are
-   * other floors' repositories a worker in its own worktree works in too (see makeWorkspace).
+   * other floors' repositories a worker in its own worktree works in too (see makeWorkspace). With
+   * `checkout`, one of this floor's linked checkouts, it works in that repository instead of the floor's
+   * own (see WorkerInfo.checkout).
    */
-  spawn(deskId: string, by: string, prompt?: string, worktree = false, kind: WorkerKind = 'agent', provider?: AgentProvider, model?: string, effort?: AgentEffort, meeting?: { id: string; worktree?: WorkerInfo['worktree'] }, owner?: string, repos: RepoSource[] = []): WorkerInfo | string {
+  spawn(deskId: string, by: string, prompt?: string, worktree = false, kind: WorkerKind = 'agent', provider?: AgentProvider, model?: string, effort?: AgentEffort, meeting?: { id: string; worktree?: WorkerInfo['worktree'] }, owner?: string, repos: RepoSource[] = [], checkout?: string): WorkerInfo | string {
     // Nobody picked (a board agent, say): the office's default worker, model and effort included.
     if (kind === 'agent' && provider === undefined) ({ provider, model, effort } = this.officeDefault);
     const selectedProvider = kind === 'agent' ? provider : undefined;
@@ -353,6 +553,8 @@ export class WorkerManager {
     if (meeting && (kind !== 'agent' || worktree)) return 'A meeting seats agents, in its own worktree';
     if (repos.length && (kind !== 'agent' || !worktree || seat.station || meeting)) return 'Only a worker in its own worktree can work in other repositories too';
     if (repos.length > MAX_REPOS) return `A worker can take on at most ${MAX_REPOS} other repositories`;
+    if (checkout && !this.links.some((l) => l.id === checkout)) return "That repository isn't on this floor any more";
+    if (checkout && (seat.station || meeting)) return "Board agents and meetings work in the floor's own checkout";
     if (kind === 'shell' && provider !== undefined) return 'Shell workers do not have an agent provider';
     if (kind === 'agent' && selectedProvider === 'custom' && this.defaultProvider !== 'custom') return 'Custom is not the configured agent provider';
     if (kind === 'agent') {
@@ -370,7 +572,10 @@ export class WorkerManager {
     let others: WorkerRepo[] | undefined;
     if (worktree) {
       const slug = `${name.toLowerCase()}-${id.slice(0, 4)}`;
-      const made = repos.length ? this.makeWorkspace(slug, repos) : this.trees.create(slug);
+      // Cut from the checkout it works in, but kept with this floor's other worktrees.
+      const own = this.home({ checkout });
+      if (typeof own === 'string') return own;
+      const made = repos.length ? this.makeWorkspace(slug, repos, own) : own.trees.create(slug, undefined, this.dir);
       if (typeof made === 'string') return made;
       if ('repos' in made) {
         ({ worktree: wt, repos: others } = made);
@@ -397,6 +602,7 @@ export class WorkerManager {
       prompt: kind === 'shell' ? undefined : prompt?.trim() || undefined,
       worktree: wt,
       repos: others,
+      checkout,
       cols: 100,
       rows: 30,
       viewers: [],
@@ -416,24 +622,25 @@ export class WorkerManager {
 
   /**
    * The workspace of a worker across repositories: `.agent-office/worktrees/<slug>`, with a worktree of
-   * this floor's project and of each of `repos` in it, all on office/<slug>, and a brief for the agent
-   * (the 'worker.repos' prompt, as CLAUDE.md and AGENTS.md). All or nothing: when one repository
-   * can't have its worktree, the ones already made are taken out again.
+   * the checkout it works in (`own`: this floor's project, or one linked to it) and of each of `repos`
+   * in it, all on office/<slug>, and a brief for the agent (the 'worker.repos' prompt, as CLAUDE.md and
+   * AGENTS.md). All or nothing: when one repository can't have its worktree, the ones already made are
+   * taken out again.
    */
-  private makeWorkspace(slug: string, repos: RepoSource[]): { worktree: NonNullable<WorkerInfo['worktree']>; repos: WorkerRepo[]; notes: string[] } | string {
+  private makeWorkspace(slug: string, repos: RepoSource[], own: Home = this.home({}) as Home): { worktree: NonNullable<WorkerInfo['worktree']>; repos: WorkerRepo[]; notes: string[] } | string {
     // A branch can only be checked out once per repository, and two floors can be checkouts of the same one.
     const seen = new Map<string, string>();
-    const own = this.trees.commonDir();
-    if (!own) return "This floor's project isn't a git checkout";
-    seen.set(own, "this floor's project");
+    const common = own.trees.commonDir();
+    if (!common) return "This floor's project isn't a git checkout";
+    seen.set(common, "this floor's project");
     for (const r of repos) {
-      const common = new Worktrees(r.dir).commonDir();
-      if (!common) return `${r.name} isn't a git checkout`;
-      const twin = seen.get(common);
+      const theirs = new Worktrees(r.dir).commonDir();
+      if (!theirs) return `${r.name} isn't a git checkout`;
+      const twin = seen.get(theirs);
       if (twin) return `${r.name} is the same repository as ${twin}`;
-      seen.set(common, r.name);
+      seen.set(theirs, r.name);
     }
-    const names = workspaceNames([this.dir, ...repos.map((r) => r.dir)]);
+    const names = workspaceNames([own.dir, ...repos.map((r) => r.dir)]);
     const made: { trees: Worktrees; ref: WorktreeRef }[] = [];
     const fail = (why: string) => {
       // Fresh branches with nothing on them: nothing is lost taking them out again.
@@ -443,11 +650,11 @@ export class WorkerManager {
       })();
       return why;
     };
-    const first = this.trees.create(slug, names[0]);
+    const first = own.trees.create(slug, names[0], this.dir);
     if (typeof first === 'string') return fail(first);
     const { note, ...primary } = first;
     const notes = note ? [`${names[0]} ${note}`] : [];
-    made.push({ trees: this.trees, ref: primary });
+    made.push({ trees: own.trees, ref: own.ref(primary) });
     const others: WorkerRepo[] = [];
     for (const [i, r] of repos.entries()) {
       const trees = new Worktrees(r.dir);
@@ -455,9 +662,9 @@ export class WorkerManager {
       if (typeof wt === 'string') return fail(`${r.name}: ${wt}`);
       if (wt.note) notes.push(`${names[i + 1]} ${wt.note}`);
       made.push({ trees, ref: { ...wt, path: path.relative(r.dir, path.join(this.dir, wt.path)) } });
-      others.push({ floor: r.floor, name: names[i + 1], repo: r.repo, dir: r.dir, path: wt.path, branch: wt.branch, base: wt.base, from: wt.from });
+      others.push({ floor: r.floor, checkout: r.checkout, name: names[i + 1], repo: r.repo, dir: r.dir, path: wt.path, branch: wt.branch, base: wt.base, from: wt.from });
     }
-    const home = originRepo(this.dir) ?? path.basename(this.dir);
+    const home = originRepo(own.dir) ?? path.basename(own.dir);
     const line = (name: string, project: string, from?: string, note = '') => `- \`${name}/\`: ${project}${from ? `, cut from ${from}` : ''}${note}`;
     const brief = officePrompt(this.prompts, 'worker.repos', {
       branch: primary.branch,
@@ -472,11 +679,25 @@ export class WorkerManager {
     return { worktree: primary, repos: others, notes };
   }
 
-  /** Starts a worker that isn't running again, carrying on its session, with `prompt` as its next message. */
-  resume(id: string, prompt?: string): string | undefined {
+  /**
+   * Starts a worker that isn't running again, carrying on its session, with `prompt` as its next
+   * message. Never while a Claude process outside the office has that conversation open (two of them
+   * would both write to it): only taking it over (`takeOver`, which someone confirmed) does that.
+   */
+  resume(id: string, prompt?: string, takingOver = false): string | undefined {
     const w = this.workers.get(id);
     if (!w) return 'No such worker';
     if (w.pty) return 'Worker is already running';
+    const why = this.stranded(id);
+    if (why) return why;
+    if (!takingOver) {
+      // It's someone's terminal's to run: only taking it over (see takeOver) starts it here.
+      if (w.info.external) return `${w.info.name} is running in your terminal — take it over to carry it on here`;
+      const open = w.info.kind === 'agent' && w.info.sessionId ? this.holder(w.info.sessionId) : undefined;
+      if (open) return `${w.info.name}'s conversation is open in a terminal (PID ${open.pid}) — close it there or use Take over`;
+    }
+    // Woken on purpose: from now on it wakes up with everyone else again.
+    w.noWake = false;
     w.info.status = 'starting';
     w.info.exitCode = undefined;
     const station = DESK_BY_ID.get(w.info.deskId)?.station;
@@ -522,7 +743,212 @@ export class WorkerManager {
 
   /** Starts every worker that isn't running: nobody should be found asleep at their desk. */
   wakeAll() {
-    for (const w of this.workers.values()) if (!w.pty) this.resume(w.info.id);
+    // Except a session in someone's terminal, running there, and one that was until it ended there:
+    // whoever left it can pick it up with R.
+    // Nor one whose repository is off the floor (see stranded).
+    for (const w of this.workers.values()) if (!w.pty && !w.info.external && !w.noWake && !this.stranded(w.info.id)) this.resume(w.info.id);
+  }
+
+  /**
+   * Seats the Claude Code sessions running in someone's own terminal in this floor's checkout (see
+   * sessions.ts; `live` is every one on the machine) at free desks, as workers that say they're in
+   * that terminal (WorkerInfo.external), and lets those whose process has gone become sleeping
+   * workers that only R wakes (noWake), carrying their conversation on in the office. One whose
+   * conversation a terminal has open now, resumed there, is that terminal's again. Nothing is ever
+   * started or stopped here. Sessions in the office's worktrees and workspaces are left out (they're
+   * the office's own workers), and so are the office's own workers here, by their process (or one of
+   * its parents) or their session. `live` is null when the registry couldn't be read: then nothing
+   * changes. `titleOf` names a new one (by default from the first thing typed into it).
+   */
+  syncTerminals(live: LiveSession[] | null = liveClaudeSessions(claudeConfigDir(), this.probe), titleOf: (s: LiveSession) => string | undefined = (s) => sessionTitle(claudeConfigDir(), s.cwd, s.sessionId) ?? s.name) {
+    // The registry couldn't be read: that says nothing about who's running, so nothing changes.
+    if (!live) return;
+    const byPid = new Map(live.map((s) => [s.pid, s]));
+    // Its process is gone: the pid may come round again for something else.
+    for (const pid of this.dismissed) if (!byPid.has(pid) && !this.probe.alive(pid)) this.dismissed.delete(pid);
+    for (const pid of this.underUs.keys()) if (!byPid.has(pid)) this.underUs.delete(pid);
+    let changed = false;
+    for (const w of this.workers.values()) {
+      const ext = w.info.external;
+      if (!ext) continue;
+      const now = byPid.get(ext.pid);
+      if (now) {
+        // /clear or /resume in the terminal: the same process on another conversation.
+        if (now.sessionId !== w.info.sessionId) {
+          w.info.sessionId = now.sessionId;
+          this.emitUpdate(w);
+          changed = true;
+        }
+        continue;
+      }
+      // Missing from this read of the registry but still running (a file being rewritten): still there.
+      if (sameProcess(ext.pid, w.terminal?.procStart, this.probe)) continue;
+      // Closed in the terminal: asleep at its desk, until someone presses R to carry it on here.
+      w.info.external = undefined;
+      w.noWake = true;
+      w.info.status = 'offline';
+      w.info.activity = 'Its terminal session ended — press R to carry it on in the office';
+      this.events.toast(`🖥️ ${w.info.name}'s terminal session ended — press R at its desk to carry it on in the office`, 'info');
+      this.emitUpdate(w);
+      changed = true;
+    }
+    const externals = new Set<number>();
+    for (const w of this.workers.values()) if (w.info.external) externals.add(w.info.external.pid);
+    // The cheap checks first: whether a process is under one of the office's terminals asks `ps`.
+    for (const s of live) {
+      if (externals.has(s.pid)) continue;
+      // A conversation one of the workers here had, open in a terminal now (resumed there, or never
+      // closed after a take-over): it's that terminal's while it runs, so nothing here resumes it.
+      const had = [...this.workers.values()].find((w) => w.info.sessionId === s.sessionId);
+      if (had) {
+        if (had.pty || had.info.external || this.ours(s.pid)) continue;
+        had.info.external = { pid: s.pid, since: s.startedAt || Date.now() };
+        had.terminal = { cwd: this.checkoutAt(s.cwd) ? s.cwd : (had.terminal?.cwd ?? this.homeDir(had.info)), procStart: s.procStart };
+        had.info.status = 'offline';
+        had.info.activity = `🖥️ In your terminal (PID ${s.pid})`;
+        externals.add(s.pid);
+        this.emitUpdate(had);
+        changed = true;
+        continue;
+      }
+      if (this.dismissed.has(s.pid)) continue;
+      // In one of this floor's checkouts, its own or a linked one: the worker works in that one.
+      const at = this.checkoutAt(s.cwd);
+      if (!at || this.ours(s.pid)) continue;
+      const seat = nextFreeSeat((id) => this.deskOccupied(id));
+      if (!seat) break;
+      const title = titleOf(s)?.replace(/\s+/g, ' ').trim() || undefined;
+      const info: WorkerInfo = {
+        id: randomBytes(6).toString('hex'),
+        kind: 'agent',
+        provider: 'claude',
+        deskId: seat.id,
+        name: title ? truncate(title, TERMINAL_NAME_MAX) : TERMINAL_NAME,
+        color: COLORS[Math.floor(Math.random() * COLORS.length)],
+        // Not running here: asleep, as far as the office's own terminals go.
+        status: 'offline',
+        acked: true,
+        createdBy: 'terminal',
+        createdAt: s.startedAt || Date.now(),
+        title,
+        sessionId: s.sessionId,
+        activity: `🖥️ In your terminal (PID ${s.pid})`,
+        cols: 100,
+        rows: 30,
+        viewers: [],
+        viewerIds: [],
+        external: { pid: s.pid, since: s.startedAt || Date.now() },
+        checkout: at.checkout,
+      };
+      // No owner: it runs as the office once taken over, on the office's own Claude sign-in, which is
+      // where its session was found (an account's own sign-in has a config folder of its own).
+      const w = newWorker(info, newTracker());
+      w.terminal = { cwd: s.cwd, procStart: s.procStart };
+      this.workers.set(info.id, w);
+      externals.add(s.pid);
+      this.emitUpdate(w);
+      changed = true;
+    }
+    if (changed) this.persist();
+  }
+
+  /**
+   * Whether a Claude process is one of this floor's own: one of its terminals, or something running
+   * under one (a worker's agent started through a shell). Parents that can't be told: not ours.
+   */
+  private ours(pid: number): boolean {
+    const roots = new Set<number>();
+    const now = Date.now();
+    for (const w of this.workers.values()) {
+      if (w.pty?.pid) roots.add(w.pty.pid);
+      // A terminal of its kept in the host, not picked back up yet (see stranded).
+      if (w.saved?.pid) roots.add(w.saved.pid);
+      // Its terminal just went (the terminal host died): its Claude may still be on its way out.
+      if (w.lastPty && now - w.lastPty.at < LAST_PTY_MS) roots.add(w.lastPty.pid);
+    }
+    if (roots.has(pid)) return true;
+    if (!roots.size) return false;
+    // A process never gains a parent, so what was found holds for as long as the terminals are the same ones.
+    const of = [...roots].sort((a, b) => a - b).join(' ');
+    const known = this.underUs.get(pid);
+    if (known && known.of === of) return known.under;
+    const under = descendsFrom(pid, roots, this.probe);
+    this.underUs.set(pid, { under, of });
+    return under;
+  }
+
+  /** The Claude process outside the office that has a conversation open right now, if one has. */
+  private holder(sessionId: string): LiveSession | undefined {
+    return liveClaudeSessions(claudeConfigDir(), this.probe, sessionId)?.find((s) => !this.ours(s.pid));
+  }
+
+  /**
+   * Carries a session from someone's terminal (WorkerInfo.external) on in the office: `claude --resume`
+   * of its conversation, at its desk. Its terminal isn't touched, even while it's still running there:
+   * whoever took it over closes that themselves (two Claudes on one conversation each write to it).
+   * It has no owner, so it runs on the office's own Claude sign-in, whose config folder the session
+   * was found in (see syncTerminals), and --resume finds its transcript there. Returns the terminal's
+   * Claude process, or why it can't.
+   */
+  takeOver(id: string): { pid: number } | string {
+    const w = this.workers.get(id);
+    if (!w) return 'No such worker';
+    const ext = w.info.external;
+    if (!ext) return `${w.info.name} isn't in a terminal outside the office`;
+    if (!w.info.sessionId) return `${w.info.name} has no Claude session to carry on`;
+    w.info.external = undefined;
+    // Still running in the terminal, maybe: it isn't to come back as a second worker.
+    this.dismissed.add(ext.pid);
+    const err = this.resume(id, undefined, true);
+    if (err) {
+      w.info.external = ext;
+      this.dismissed.delete(ext.pid);
+      return err;
+    }
+    return { pid: ext.pid };
+  }
+
+  /**
+   * This floor's checkouts, its own first and then the linked ones, each as given and with its
+   * symlinks resolved (as the sessions' folders are).
+   */
+  private roots(): { checkout?: string; dirs: string[] }[] {
+    const all: { checkout?: string; dir: string }[] = [{ dir: this.dir }, ...this.links.map((l) => ({ checkout: l.id, dir: l.dir }))];
+    this.rootCache ??= all.map(({ checkout, dir }) => {
+      let real: string;
+      try {
+        real = realpathSync(dir);
+      } catch {
+        real = path.resolve(dir);
+      }
+      return { checkout, dirs: [...new Set([path.resolve(dir), real])] };
+    });
+    return this.rootCache;
+  }
+
+  /** Somewhere in one of this floor's checkouts. */
+  private inFloor(p: string): boolean {
+    const abs = path.resolve(p);
+    return this.roots().some((r) => r.dirs.some((root) => inside(abs, root)));
+  }
+
+  /**
+   * Which of this floor's checkouts `cwd` is in (`checkout` unset for the floor's own), leaving out the
+   * office's worktrees and workspaces, which are the office's own workers; undefined for anywhere else.
+   */
+  private checkoutAt(cwd: string): { checkout?: string } | undefined {
+    for (const r of this.roots()) {
+      for (const root of r.dirs) {
+        if (!inside(cwd, root)) continue;
+        if (inside(cwd, path.join(root, WORKTREES_DIR))) return undefined;
+        const theirs = [...this.workers.values()].some((w) => {
+          const rel = workspaceOf(w.info);
+          return !!rel && inside(cwd, path.join(root, rel));
+        });
+        return theirs ? undefined : { checkout: r.checkout };
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -534,9 +960,14 @@ export class WorkerManager {
   async kill(id: string, cleanup?: WorktreeCleanup, landed?: string, landedRepos?: Record<string, string | undefined>): Promise<{ note?: string; error?: string }> {
     const w = this.workers.get(id);
     if (!w) return {};
+    // Its worktree and branch are in a repository the floor doesn't have now: nothing to clean them up with.
+    const why = this.stranded(id);
+    if (why) return { error: why };
     this.workers.delete(id);
     this.namer.forget(id);
     clearTimeout(w.scanTimer);
+    // A session in someone's terminal leaves the desk and carries on there; it isn't seated again.
+    if (w.info.external) this.dismissed.add(w.info.external.pid);
     const proc = w.pty;
     w.pty = undefined; // so the exit handler knows this worker is gone and stays quiet
     try {
@@ -552,11 +983,15 @@ export class WorkerManager {
     // A meeting's worktree is everyone at the table's: the meeting tidies it away once they've all gone.
     if (!w.info.worktree || w.info.meeting) return {};
     // On the branch its work is on, should it have switched since it last came to rest.
-    const wt = await this.current(w.info.worktree);
+    const wt = await this.current(w.info, w.info.worktree);
     const name = w.info.name;
     if (w.info.repos?.length) return this.clearRepos(w.info, cleanup, landed, landedRepos);
+    // The repository it's a worktree of: this floor's, or a linked checkout's.
+    const own = this.home(w.info);
+    if (typeof own === 'string') return { error: `Couldn't clean up ${name}'s worktree: ${own}` };
+    const { trees, ref } = own;
     if (!cleanup) {
-      const work = describeWork(await this.trees.inspect(wt, landed));
+      const work = describeWork(await trees.inspect(ref(wt), landed));
       if (work) return { note: `Kept ${name}'s worktree and branch ${wt.branch} — it has ${work}` };
       cleanup = 'all';
     }
@@ -564,22 +999,22 @@ export class WorkerManager {
     let gone = wt;
     let kept = '';
     if (cleanup === 'all' && wt.made) {
-      if (!(await this.trees.hasBranch(wt.made))) {
+      if (!(await trees.hasBranch(wt.made))) {
         // The agent deleted the office's branch (a rename is followed, see current), so git can't say
         // whether the one it's on is its own or was there before it: that one stays.
         cleanup = 'worktree';
       } else {
         // The office's own branch stays while it has commits that no remote, the project's checkout
         // or the branch it's on has.
-        const work = await this.trees.wouldLose(wt.made, [wt.branch]);
+        const work = await trees.wouldLose(wt.made, [wt.branch]);
         if (work) kept = ` and kept branch ${wt.made} — it has ${work}`;
         // A branch it made itself goes with it; one that was there before it (main, say) isn't the office's to delete.
-        if (await this.trees.madeSince(wt.branch, wt.made)) gone = work ? { ...wt, made: undefined } : wt;
+        if (await trees.madeSince(wt.branch, wt.made)) gone = work ? { ...wt, made: undefined } : wt;
         else if (work) cleanup = 'worktree';
         else gone = { ...wt, branch: wt.made, made: undefined };
       }
     }
-    const error = await this.trees.remove(gone, cleanup);
+    const error = await trees.remove(ref(gone), cleanup);
     if (error) return { error: `Couldn't delete ${name}'s worktree: ${error}` };
     if (cleanup === 'worktree') return { note: `Deleted ${name}'s worktree${kept || ` and kept branch ${wt.branch}`}` };
     return { note: `Deleted ${name}'s worktree and branch ${gone.branch}${kept && `,${kept}`}` };
@@ -589,6 +1024,7 @@ export class WorkerManager {
   private async clearRepos(info: WorkerInfo, cleanup: WorktreeCleanup | undefined, landed?: string, landedRepos?: Record<string, string | undefined>): Promise<{ note?: string; error?: string }> {
     const trees = this.treesOf(info, landed, landedRepos);
     const { name } = info;
+    if (typeof trees === 'string') return { error: `Couldn't clean up ${name}'s worktrees: ${trees}` };
     const branch = info.worktree!.branch;
     const where = trees.map((t) => t.name).join(', ');
     if (!cleanup) {
@@ -612,15 +1048,17 @@ export class WorkerManager {
    * workspace, git plumbing for its repository, its worktree in that repository's terms, and the
    * commit its merged pull request delivered, when known.
    */
-  private treesOf(info: WorkerInfo, landed?: string, landedRepos?: Record<string, string | undefined>): { name: string; trees: Worktrees; ref: WorktreeRef; landed?: string }[] {
+  private treesOf(info: WorkerInfo, landed?: string, landedRepos?: Record<string, string | undefined>): { name: string; trees: Worktrees; ref: WorktreeRef; landed?: string }[] | string {
     const wt = info.worktree!;
+    const own = this.home(info);
+    if (typeof own === 'string') return own;
     return [
-      { name: path.basename(wt.path), trees: this.trees, ref: wt, landed },
+      { name: path.basename(wt.path), trees: own.trees, ref: own.ref(wt), landed },
       ...(info.repos ?? []).map((r) => ({
         name: r.name,
         trees: new Worktrees(r.dir),
         ref: { path: path.relative(r.dir, path.join(this.dir, r.path)), branch: r.branch, base: r.base },
-        landed: landedRepos?.[r.floor],
+        landed: landedRepos?.[repoKey(r)],
       })),
     ];
   }
@@ -632,7 +1070,10 @@ export class WorkerManager {
   async holdsWork(id: string, landed?: string, landedRepos?: Record<string, string | undefined>): Promise<boolean> {
     const info = this.workers.get(id)?.info;
     if (!info?.worktree) return false;
-    const states = await Promise.all(this.treesOf(info, landed, landedRepos).map(async (t) => describeWork(await t.trees.inspect(t.ref, t.landed))));
+    const trees = this.treesOf(info, landed, landedRepos);
+    // Can't be looked at (see stranded): it might, so it stays.
+    if (typeof trees === 'string') return true;
+    const states = await Promise.all(trees.map(async (t) => describeWork(await t.trees.inspect(t.ref, t.landed))));
     return states.some(Boolean);
   }
 
@@ -641,11 +1082,17 @@ export class WorkerManager {
     const w = this.workers.get(id);
     const info = w?.info;
     if (!w || !info?.worktree) return undefined;
+    const why = this.stranded(id);
+    if (why) return { exists: true, dirty: 0, ahead: 0, unpushed: 0, error: why };
     if (!info.repos?.length) {
       await this.syncBranch(w);
-      return this.trees.inspect(w.info.worktree!);
+      const own = this.home(info);
+      if (typeof own === 'string') return { exists: true, dirty: 0, ahead: 0, unpushed: 0, error: own };
+      return own.trees.inspect(own.ref(w.info.worktree!));
     }
-    const repos = await Promise.all(this.treesOf(info).map(async (t) => ({ name: t.name, state: await t.trees.inspect(t.ref) })));
+    const trees = this.treesOf(info);
+    if (typeof trees === 'string') return { exists: true, dirty: 0, ahead: 0, unpushed: 0, error: trees };
+    const repos = await Promise.all(trees.map(async (t) => ({ name: t.name, state: await t.trees.inspect(t.ref) })));
     const sum = (k: 'dirty' | 'ahead' | 'unpushed') => repos.reduce((n, r) => n + r.state[k], 0);
     const errors = repos.filter((r) => r.state.error).map((r) => `${r.name}: ${r.state.error}`);
     return { exists: repos.every((r) => r.state.exists), dirty: sum('dirty'), ahead: sum('ahead'), unpushed: sum('unpushed'), error: errors.length ? errors.join('; ') : undefined, repos };
@@ -666,7 +1113,7 @@ export class WorkerManager {
   private async syncBranch(w: Worker): Promise<void> {
     const wt = w.info.worktree;
     if (!wt || w.info.meeting || w.info.repos?.length) return;
-    const now = await this.current(wt);
+    const now = await this.current(w.info, wt);
     // Sent home meanwhile, or another look got there first.
     if (now === wt || this.workers.get(w.info.id) !== w || w.info.worktree !== wt) return;
     w.info.worktree = now;
@@ -674,13 +1121,16 @@ export class WorkerManager {
     this.persist();
   }
 
-  /** A worktree on the branch it's on now, with the office's own branch kept in `made`; the same one when nothing moved. */
-  private async current(wt: Worktree): Promise<Worktree> {
-    const live = await this.trees.branchOf(wt);
+  /** A worktree of `info`'s on the branch it's on now, with the office's own branch kept in `made`; the same one when nothing moved. */
+  private async current(info: WorkerInfo, wt: Worktree): Promise<Worktree> {
+    const own = this.home(info);
+    if (typeof own === 'string') return wt;
+    const { trees, ref } = own;
+    const live = await trees.branchOf(ref(wt));
     if (!live) return wt;
     let made = wt.made ?? (live === wt.branch ? undefined : wt.branch);
     // Back on it, or renamed it (`git branch -m fix-x`): the branch it's on is the office's own.
-    if (made === live || (made && (await this.trees.renamedTo(made, live)))) made = undefined;
+    if (made === live || (made && (await trees.renamedTo(made, live)))) made = undefined;
     return live === wt.branch && made === wt.made ? wt : { ...wt, branch: live, made };
   }
 
@@ -780,6 +1230,8 @@ export class WorkerManager {
   async openPr(id: string, by: string, as?: GhAs): Promise<{ prs: OpenedPr[]; failed: string[] } | string> {
     const w = this.workers.get(id);
     if (!w) return 'No such worker';
+    const why = this.stranded(id);
+    if (why) return why;
     const { info } = w;
     const wt = info.worktree;
     if (!wt) return `${info.name} works in the main checkout — only workers with their own worktree can open a PR`;
@@ -806,8 +1258,10 @@ export class WorkerManager {
         return { prs: [{ ...open, existed: true, dirty }], failed: [] };
       }
       await run('git', ['push', '-u', 'origin', branch], cwd, 90_000, as?.env);
-      const base = await this.pushedBranch([wt.from, this.trees.currentBranch()], branch);
-      const { title, body } = draftPr(info, commits, by);
+      const own = this.home(info);
+      if (typeof own === 'string') return own;
+      const base = await this.pushedBranch([wt.from, own.trees.currentBranch()], branch, own.dir);
+      const { title, body } = draftPr(info, commits, by, undefined, originRepo(own.dir));
       const { number, url } = await createPr(branch, base, title, body, cwd, as);
       info.pr = { number, url };
       this.persist();
@@ -830,9 +1284,10 @@ export class WorkerManager {
   private async openPrs(w: Worker, by: string, as?: GhAs): Promise<{ prs: OpenedPr[]; failed: string[] } | string> {
     const { info } = w;
     const wt = info.worktree!;
-    const home = originRepo(this.dir);
+    const at = this.homeDir(info);
+    const home = originRepo(at);
     const parts = [
-      { name: path.basename(wt.path), dir: this.dir, ...wt, pr: info.pr, own: true, set: (pr: { number: number; url: string }) => (info.pr = pr) },
+      { name: path.basename(wt.path), dir: at, ...wt, pr: info.pr, own: true, set: (pr: { number: number; url: string }) => (info.pr = pr) },
       ...info.repos!.map((r) => ({ ...r, own: false, set: (pr: { number: number; url: string }) => (r.pr = pr) })),
     ];
     const gone = parts.filter((p) => !existsSync(path.join(this.dir, p.path)));
@@ -860,7 +1315,7 @@ export class WorkerManager {
           }
           await run('git', ['push', '-u', 'origin', p.branch], cwd, 90_000, as?.env);
           const base = await this.pushedBranch([p.from, new Worktrees(p.dir).currentBranch()], p.branch, p.dir);
-          const { title, body } = draftPr(info, commits, by, p.own ? undefined : { home });
+          const { title, body } = draftPr(info, commits, by, p.own ? undefined : { home }, p.own ? home : originRepo(p.dir));
           const pr = await createPr(p.branch, base, title, body, cwd, as);
           p.set(pr);
           this.persist();
@@ -1293,7 +1748,7 @@ export class WorkerManager {
         this.startFailed(w, `whoever hired ${info.name} (${info.createdBy}) isn't signed in to Claude — they can sign in under ☰ → 🔐 Your sign-ins, then press R here`);
         return;
       }
-      this.runAs.apply(w.owner, env, [this.dir, cwd]);
+      this.runAs.apply(w.owner, env, [this.homeDir(info), cwd]);
     }
     if (isCodex) w.codexHome = codexHome(cwd, env);
     // The host keeps its own copy of the screen for the next office: it starts with the same history.
@@ -1327,8 +1782,9 @@ export class WorkerManager {
   /** Takes back a terminal the host kept running while the office was down. */
   private adopt(w: Worker, adopted: Adopted, saved: NonNullable<Worker['saved']>) {
     const { info } = w;
-    // It kept working through the restart: nothing to carry on.
+    // It kept working through the restart: nothing to carry on, and it's the office's terminal, not someone's own.
     w.interrupted = false;
+    info.external = undefined;
     info.cols = adopted.cols;
     info.rows = adopted.rows;
     const term = this.newTerm(w);
@@ -1400,6 +1856,7 @@ export class WorkerManager {
     proc.onExit(({ exitCode, error, lost }) => {
       if (w.pty !== proc || this.workers.get(info.id) !== w) return;
       w.pty = undefined;
+      if (proc.pid) w.lastPty = { pid: proc.pid, at: Date.now() };
       if (error) {
         this.startFailed(w, error);
         return;
@@ -1407,7 +1864,13 @@ export class WorkerManager {
       // The terminal host died and took the process with it: nothing the worker did.
       if (lost && !this.closing) {
         if (midTurn(w)) w.interrupted = true;
-        this.resume(info.id);
+        const err = this.resume(info.id);
+        // Its conversation is open in a terminal by now: it waits, asleep, rather than open it twice.
+        if (err) {
+          info.status = 'exited';
+          this.events.toast(err, 'warn');
+          this.emitUpdate(w);
+        }
         return;
       }
       if (isCodex && !this.closing) this.scheduleScan(w);
@@ -1463,10 +1926,16 @@ export class WorkerManager {
     return info.provider === this.defaultProvider ? this.agentCmd : info.provider ?? this.agentCmd;
   }
 
-  /** Where a worker works: its worktree, a workspace for a worker across repositories, or the project itself. */
+  /**
+   * Where a worker works: its worktree, a workspace for a worker across repositories, or the checkout
+   * it works in itself (this floor's, or one linked to it).
+   */
   private cwd(info: WorkerInfo): string {
     const rel = workspaceOf(info);
-    return rel ? path.join(this.dir, rel) : this.dir;
+    if (rel) return path.join(this.dir, rel);
+    // One from a terminal carries on in the folder its session ran in, while that's still there.
+    const from = this.workers.get(info.id)?.terminal?.cwd;
+    return from && existsSync(from) ? from : this.homeDir(info);
   }
 
   /** Hooks fire in bursts (every tool call); one read a moment later covers the whole burst. */
@@ -1674,7 +2143,9 @@ process.stdin.on('end', () => {
   }
 
   private persist() {
-    const saved = [...this.workers.values()].map(({ info, owner, tracker, codexTranscript, hookToken, pty, bootBlocked, interrupted }) => ({
+    // Which repository each one in a linked checkout works in, while the floor has it (see linkOf).
+    for (const w of this.workers.values()) if (w.info.checkout) this.linkOf(w);
+    const saved = [...this.workers.values()].map(({ info, owner, tracker, codexTranscript, hookToken, pty, bootBlocked, interrupted, terminal, noWake, saved: waiting, checkoutName, checkoutAt }) => ({
       id: info.id,
       owner,
       kind: info.kind,
@@ -1689,18 +2160,26 @@ process.stdin.on('end', () => {
       prompt: info.prompt,
       worktree: info.worktree,
       repos: info.repos,
+      checkout: info.checkout,
+      // So a floor that no longer has it can still say which repository it was (see stranded).
+      checkoutName: info.checkout ? checkoutName : undefined,
+      checkoutAt: info.checkout ? checkoutAt : undefined,
       title: info.title,
       sessionId: info.sessionId,
       activity: info.activity,
       task: info.task,
       pr: info.pr,
       meeting: info.meeting,
+      external: info.external,
+      terminal,
+      noWake: noWake || undefined,
       tracker: info.kind === 'agent' ? tracker : undefined,
       usage: info.provider === 'opencode' || info.provider === 'codex' ? info.usage : undefined,
       codexTranscript: info.provider === 'codex' ? codexTranscript : undefined,
       // A terminal still running in the host, to pick back up after a restart. Its hooks keep the token.
       hookToken,
-      pty: pty?.id ? { id: pty.id, status: info.status, acked: info.acked, waitingSince: info.waitingSince } : undefined,
+      // Or one kept in the host for a worker whose repository is off the floor for now (see stranded).
+      pty: pty?.id ? { id: pty.id, pid: pty.pid, status: info.status, acked: info.acked, waitingSince: info.waitingSince } : waiting ? { id: waiting.ptyId, pid: waiting.pid, status: waiting.status, acked: waiting.acked, waitingSince: waiting.waitingSince } : undefined,
       // In the middle of something: if its terminal doesn't make it through a restart, it carries on after.
       midTurn: !this.stopping && (!!interrupted || midTurn({ info, bootBlocked })),
     }));
@@ -1714,9 +2193,12 @@ process.stdin.on('end', () => {
   private restore() {
     if (!existsSync(this.statePath)) return;
     try {
-      const saved = JSON.parse(readFileSync(this.statePath, 'utf8')) as (Partial<WorkerInfo> & { owner?: unknown; tracker?: unknown; codexTranscript?: unknown; hookToken?: unknown; pty?: any; midTurn?: unknown })[];
+      const saved = JSON.parse(readFileSync(this.statePath, 'utf8')) as (Partial<WorkerInfo> & { owner?: unknown; tracker?: unknown; codexTranscript?: unknown; hookToken?: unknown; pty?: any; midTurn?: unknown; terminal?: any; noWake?: unknown; checkoutName?: unknown; checkoutAt?: any })[];
       for (const s of saved) {
         if (!s.id || !s.deskId || !DESK_BY_ID.has(s.deskId) || this.deskOccupied(s.deskId)) continue;
+        // A linked checkout of this floor's (see setLinks). One the floor no longer has can't be worked in,
+        // but the worker stays, with its worktree and its terminal, until it's back (see stranded).
+        const checkout = typeof s.checkout === 'string' && /^[a-z0-9-]{1,40}$/.test(s.checkout) ? s.checkout : undefined;
         const tracker = restoreTracker(s.tracker);
         const provider = s.kind === 'shell'
           ? undefined
@@ -1741,6 +2223,7 @@ process.stdin.on('end', () => {
           prompt: s.prompt,
           worktree: s.worktree,
           repos: s.worktree ? validRepos(s.repos) : undefined,
+          checkout,
           title: s.title,
           sessionId: s.sessionId,
           activity: s.activity,
@@ -1752,20 +2235,36 @@ process.stdin.on('end', () => {
           viewers: [],
           viewerIds: [],
           meeting: typeof s.meeting === 'string' && DESK_BY_ID.get(s.deskId)?.room ? s.meeting : undefined,
+          // Still in someone's terminal, as far as the last office knew: the first syncTerminals says whether it still is.
+          external: s.external && Number.isInteger(s.external.pid) && s.external.pid > 0 ? { pid: s.external.pid, since: typeof s.external.since === 'number' ? s.external.since : 0 } : undefined,
         };
         const w = newWorker(info, tracker, typeof s.hookToken === 'string' && s.hookToken ? s.hookToken : undefined);
         if (typeof s.owner === 'string' && s.owner) w.owner = s.owner;
+        if (checkout) {
+          w.checkoutName = typeof s.checkoutName === 'string' ? s.checkoutName.slice(0, 100) : undefined;
+          const at = s.checkoutAt;
+          if (at && typeof at.dir === 'string' && path.isAbsolute(at.dir)) w.checkoutAt = { dir: at.dir, repo: normalizeRepo(at.repo) };
+        }
         if (provider === 'codex' && typeof s.codexTranscript === 'string') w.codexTranscript = s.codexTranscript;
+        // The folder a terminal's session ran in: only ever one in this floor's checkout.
+        const from = s.terminal?.cwd;
+        if (typeof from === 'string' && path.isAbsolute(from) && this.inFloor(from)) w.terminal = { cwd: path.resolve(from), procStart: typeof s.terminal.procStart === 'string' ? s.terminal.procStart.slice(0, 64) : undefined };
+        w.noWake = s.noWake === true;
         w.screenDirty = false;
         if (typeof s.pty?.id === 'string') {
           const status: WorkerStatus = RUNNING.has(s.pty.status) ? s.pty.status : 'idle';
-          w.saved = { ptyId: s.pty.id, status, acked: s.pty.acked !== false, waitingSince: typeof s.pty.waitingSince === 'number' ? s.pty.waitingSince : undefined };
+          w.saved = { ptyId: s.pty.id, pid: Number.isInteger(s.pty.pid) && s.pty.pid > 0 ? s.pty.pid : undefined, status, acked: s.pty.acked !== false, waitingSince: typeof s.pty.waitingSince === 'number' ? s.pty.waitingSince : undefined };
         }
         // Mid-turn as the office went down: cut off, unless its terminal is picked back up still
         // running (adopt). An office from before midTurn only said so for a terminal in the host.
         w.interrupted = typeof s.midTurn === 'boolean' ? s.midTurn : s.pty?.status === 'working' || s.pty?.status === 'needs_input';
         if (info.prompt) w.prompts = [info.prompt.replace(/\s+/g, ' ').trim()];
         this.workers.set(info.id, w);
+        const why = this.stranded(info.id);
+        if (why) {
+          info.activity = why;
+          console.warn(`agent-office: ${why}`);
+        }
       }
     } catch {
       // corrupt state file: start fresh
@@ -1974,6 +2473,7 @@ function describeTool(payload: any): string {
 }
 
 function offlineBanner(info: WorkerInfo): string {
+  if (info.external) return `\x1b[2m${info.name} is running in your terminal (PID ${info.external.pid}), not in the office. Take it over to carry it on here.\x1b[0m\r\n`;
   const hint = info.kind === 'shell' ? ' Press R to restart it.' : info.sessionId ? ' Press R to resume the session.' : '';
   return `\x1b[2m${info.name} is not running.${hint}\x1b[0m\r\n`;
 }
@@ -2022,7 +2522,7 @@ function validRepos(raw: unknown): WorkerRepo[] | undefined {
     const floor = str(r?.floor), name = str(r?.name), dir = str(r?.dir), rel = str(r?.path), branch = str(r?.branch), base = str(r?.base);
     if (!floor || !name || !dir || !rel || !branch || !base) return [];
     const pr = r.pr && typeof r.pr.number === 'number' && typeof r.pr.url === 'string' ? { number: r.pr.number, url: r.pr.url } : undefined;
-    return [{ floor, name, repo: str(r.repo), dir, path: rel, branch, base, from: str(r.from), pr }];
+    return [{ floor, checkout: str(r.checkout), name, repo: str(r.repo), dir, path: rel, branch, base, from: str(r.from), pr }];
   });
   return repos.length ? repos : undefined;
 }
@@ -2078,20 +2578,47 @@ export function withRelated(body: string, block: string): string {
  * `other`, it's for one of the other repositories of a worker across repositories: the issue is its
  * own floor's (`home`), so this one only mentions it.
  */
-function draftPr(info: WorkerInfo, commits: string[], by: string, other?: { home?: string }): { title: string; body: string } {
+function draftPr(info: WorkerInfo, commits: string[], by: string, other?: { home?: string }, self?: string): { title: string; body: string } {
   const task = (info.prompt ?? '').replace(/\r\n?/g, '\n').trim();
   const firstLine = task.split('\n').map((l) => l.trim()).find(Boolean) ?? '';
-  // The issues board hands work over as: Work on GitHub issue #12: "Title".
-  const issue = /\bissue #(\d+):\s*["“](.+?)["”]\.?\s*$/i.exec(firstLine);
-  const title = truncate(issue?.[2] || firstLine.replace(/[.:;,]+$/, '') || commits[0]?.replace(/^\S+\s+/, '') || info.worktree?.branch || info.name, PR_TITLE_MAX);
-  const closes = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b[^\n]{0,40}?#(\d+)/i.exec(task)?.[1] ?? issue?.[1];
+  // The issues board hands work over as: Work on GitHub issue #12: "Title", or on a floor with more
+  // than one repository as: Work on GitHub issue owner/name#12: "Title".
+  const issue = /\bissue (?:([\w.-]+\/[\w.-]+))?#(\d+):\s*["“](.+?)["”]\.?\s*$/i.exec(firstLine);
+  const title = truncate(issue?.[3] || firstLine.replace(/[.:;,]+$/, '') || commits[0]?.replace(/^\S+\s+/, '') || info.worktree?.branch || info.name, PR_TITLE_MAX);
+  const closing = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b[^\n]{0,40}?(?:([\w.-]+\/[\w.-]+))?#(\d+)/i.exec(task);
+  const closes = closing?.[2] ?? issue?.[2];
+  // The repository the issue is in, when the task says (`self` is this pull request's): another one's
+  // has to be named for GitHub to close it.
+  const where = closing ? closing[1] : issue?.[1];
+  const ref = where && !sameRepo(where, self) ? `${where}#${closes}` : `#${closes}`;
   const parts: string[] = [];
   if (task) parts.push(`## Task\n\n${task.length > PR_TASK_MAX ? `${task.slice(0, PR_TASK_MAX)}…` : task}`);
   parts.push(`## Commits\n\n${commits.map((c) => `- \`${c.slice(0, c.indexOf(' '))}\` ${c.slice(c.indexOf(' ') + 1)}`).join('\n')}`);
-  if (closes && !other) parts.push(`Closes #${closes}`);
-  else if (closes && other?.home) parts.push(`Part of ${other.home}#${closes}`);
+  if (closes && !other) parts.push(`Closes ${ref}`);
+  else if (closes && (where ?? other?.home)) parts.push(`Part of ${where ?? other?.home}#${closes}`);
   parts.push(`_Opened from Agent Office by ${by} · ${info.name} at ${DESK_BY_ID.get(info.deskId)?.label ?? info.deskId}_`);
   return { title, body: parts.join('\n\n') };
+}
+
+/** `p` with its symlinks resolved, or as it is when it isn't there. */
+function realDir(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/** Whether `link` is the repository a worker worked in (see Worker.checkoutAt; none known: any is). */
+function sameCheckout(link: LinkedCheckout, at: { dir: string; repo?: string } | undefined): boolean {
+  if (!at) return true;
+  return realDir(link.dir) === at.dir && (!at.repo || !link.repo || sameRepo(at.repo, link.repo));
+}
+
+/** `p` is `root` or somewhere under it. */
+function inside(p: string, root: string): boolean {
+  const rel = path.relative(root, p);
+  return !rel || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
 }
 
 function truncate(s: string, n: number) {

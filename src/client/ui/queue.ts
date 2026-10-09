@@ -13,7 +13,8 @@ export interface QueueActions {
 /** The queue task's name, linked to its GitHub issue when it has one. */
 function taskTitle(t: QueueTask): HTMLElement {
   if (t.issue === undefined) return h('div.queue-title', { title: t.prompt }, t.title);
-  const issue = store.issues.items.find((i) => i.number === t.issue);
+  // The queue is the floor's own repository's (see GhIssue.checkout).
+  const issue = store.issues.items.find((i) => i.number === t.issue && !i.checkout);
   const text = t.title.startsWith(`#${t.issue}`) ? t.title : `#${t.issue} ${t.title}`;
   return h('div.queue-title', { title: t.prompt }, issue ? h('a', { href: issue.url, target: '_blank', rel: 'noopener' }, text) : text);
 }

@@ -130,6 +130,19 @@ test('a debate runs its rounds and ends when the chair writes the decision', (t)
   assert.ok(existsSync(path.join(f.dir, '.agent-office', 'meetings', m.id)));
 });
 
+test('a meeting called with budget 0 has no token limit and keeps going', (t) => {
+  const f = fixture(); t.after(() => f.close());
+  assert.equal(f.start({ budget: 0 }), undefined);
+  const w = f.workers[0];
+  w.status = 'working';
+  w.usage = { input: 60_000_000, output: 5_000_000, cacheRead: 0, cacheWrite: 0, cost: 40, calls: 300 };
+  f.room.onWorker(w);
+  const m = f.room.state().current!;
+  assert.equal(m.budget, 0);
+  assert.equal(m.status, 'running');
+  assert.deepEqual(f.typed, []);
+});
+
 test('the meeting stops once it runs over its token budget, and says so', (t) => {
   const f = fixture(); t.after(() => f.close());
   assert.equal(f.start({ budget: 100_000 }), undefined);

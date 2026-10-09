@@ -248,10 +248,17 @@ export class PtyHost {
     return { pty: p, cols: msg.cols, rows: msg.rows, busy: msg.busy, title: msg.title, snapshot: msg.snapshot };
   }
 
-  /** Ends the host's terminals that no worker claimed (their worker was sent home meanwhile). */
-  killUnclaimed() {
-    for (const id of this.unclaimed) this.send({ t: 'kill', id });
-    this.unclaimed.clear();
+  /**
+   * Ends the host's terminals that no worker claimed (their worker was sent home meanwhile), except
+   * `keep`: a worker's that waits to be claimed later (see WorkerManager.stranded). With `only`, just
+   * that one (its worker was forgotten).
+   */
+  killUnclaimed(keep: Set<string> = new Set(), only?: string) {
+    for (const id of [...this.unclaimed]) {
+      if (keep.has(id) || (only !== undefined && id !== only)) continue;
+      this.send({ t: 'kill', id });
+      this.unclaimed.delete(id);
+    }
   }
 
   /** The office is restarting: leave every terminal running in the host for the next one. */

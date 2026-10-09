@@ -1,4 +1,5 @@
 import { changedImageType, type ChangedFile, type ChangesState, type ServerMsg } from '../../shared/protocol';
+import { repoKey } from '../../shared/floors';
 import type { Net } from '../net';
 import { store } from '../state';
 import { h, openModal, type Modal } from './dom';
@@ -106,7 +107,7 @@ function renderPreview(workerId: string, repo: string | undefined, f: ChangedFil
 
 /**
  * The Changes window for a worker. A worker across repositories (see WorkerInfo.repos) gets a tab per
- * repository, its own floor's first; `repo` opens on another floor's one.
+ * repository, its own floor's first; `repo` (a repoKey) opens on another repository's one.
  */
 export function openChanges(net: Net, workerId: string, onTerminal?: () => void, repo?: string) {
   if (current?.workerId === workerId) return current.show(repo);
@@ -352,7 +353,7 @@ export function openChanges(net: Net, workerId: string, onTerminal?: () => void,
     if (!repos.length) return tabs.replaceChildren();
     const own = w.worktree?.path.split(/[\\/]/).pop() ?? 'this project';
     tabs.replaceChildren(
-      ...[{ id: undefined as string | undefined, name: own, pr: w.pr }, ...repos.map((r) => ({ id: r.floor as string | undefined, name: r.name, pr: r.pr }))].map((t) =>
+      ...[{ id: undefined as string | undefined, name: own, pr: w.pr }, ...repos.map((r) => ({ id: repoKey(r) as string | undefined, name: r.name, pr: r.pr }))].map((t) =>
         h(
           'button.btn',
           { type: 'button', role: 'tab', class: t.id === repo ? 'on' : '', 'aria-selected': t.id === repo ? 'true' : 'false', title: t.id ? `Its worktree of ${t.name}` : `Its worktree of this floor's project, ${t.name}`, onclick: () => show(t.id) },
@@ -365,7 +366,7 @@ export function openChanges(net: Net, workerId: string, onTerminal?: () => void,
 
   /** Switches to another of its repositories: stops following the one on screen and follows that one. */
   const show = (next?: string) => {
-    if (next === repo || (next && !store.workers.get(workerId)?.repos?.some((r) => r.floor === next))) return;
+    if (next === repo || (next && !store.workers.get(workerId)?.repos?.some((r) => repoKey(r) === next))) return;
     net.send({ t: 'changes.unwatch', workerId, repo });
     repo = next;
     state = null;
@@ -400,7 +401,7 @@ export function openChanges(net: Net, workerId: string, onTerminal?: () => void,
   current = { workerId, repo: () => repo, show, modal };
   previous?.modal.close();
   closeBtn.addEventListener('click', () => modal.close());
-  if (repo && !info.repos?.some((r) => r.floor === repo)) repo = undefined;
+  if (repo && !info.repos?.some((r) => repoKey(r) === repo)) repo = undefined;
   renderTabs();
   renderHeader();
   renderFooter();

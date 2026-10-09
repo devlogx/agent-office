@@ -1,10 +1,11 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
-import type { ChangesState, FloorInfo, PeerInfo, ProjectInfo, ServerMsg, WorkerInfo } from '../shared/protocol.js';
+import type { ChangesState, FloorInfo, FloorLinkInfo, GhIssue, GhPull, GhState, PeerInfo, ProjectInfo, ServerMsg, WorkerInfo } from '../shared/protocol.js';
 import { isBusy } from '../shared/status.js';
 import { DESK_BY_ID } from '../shared/layout.js';
-import type { FloorDef } from './building.js';
+import type { FloorDef, FloorLink } from './building.js';
+import { repoKey, splitRepoKey } from '../shared/floors.js';
 import { excludeFromGit } from './config.js';
 import { agentProviders, configuredProvider } from './agents.js';
 import { WorkerManager, type HookEnv, type RunAs } from './workers.js';
@@ -65,10 +66,81 @@ export interface FloorContext {
   lent(floor: Floor): boolean;
 }
 
-/** The open pull request on a floor's board whose head is `branch`. */
-function openPull(floor: Floor, branch: string): { number: number; url: string } | undefined {
-  const pr = floor.github.pulls.items.find((p) => p.state === 'OPEN' && p.headRefName === branch);
+/** The open pull request among `pulls` (one repository's) whose head is `branch`. */
+function openPull(pulls: GhPull[], branch: string): { number: number; url: string } | undefined {
+  const pr = pulls.find((p) => p.state === 'OPEN' && p.headRefName === branch);
   return pr ? { number: pr.number, url: pr.url } : undefined;
+}
+
+/**
+ * One of a floor's repositories with its issues and PRs: the floor's own checkout (no `checkout`), or
+ * one linked to it (see FloorLink). Pull request numbers are only unique within one.
+ */
+interface Board {
+  checkout?: string;
+  name: string;
+  repo?: string;
+  dir: string;
+  github: GitHub;
+  /** Pull requests merging, to ring the gong for. */
+  merges: MergeWatch;
+}
+
+/**
+ * A floor's repositories' lists of issues or pull requests as one, for its boards, the floor's own
+ * first. With more than one repository each item says which it's in (`repo`, its `label`, and
+ * `checkout` for a linked one's), and an error says whose it is; with just the floor's own, it's that
+ * repository's list as GitHub sent it. It was fetched as long ago as the oldest of them.
+ */
+export function gatherBoards<T extends GhIssue | GhPull>(lists: { checkout?: string; label: string; state: GhState<T> }[]): GhState<T> {
+  if (lists.length === 1) return lists[0].state;
+  const errors = lists.filter((l) => l.state.error).map((l) => `${l.label}: ${l.state.error}`);
+  return {
+    items: lists.flatMap(({ checkout, label, state }) => state.items.map((it) => ({ ...it, repo: label, checkout }))),
+    fetchedAt: Math.min(...lists.map((l) => l.state.fetchedAt)),
+    loading: lists.some((l) => l.state.loading),
+    error: errors.length ? errors.join(' · ') : undefined,
+  };
+}
+
+/** What changed on a floor's boards, for boardsChanged. */
+type BoardChange = { issues?: boolean; pulls?: boolean; settled?: boolean };
+
+/**
+ * Calls `flush` once things have been quiet for `wait` ms, with everything `add` was given since: a
+ * flag is set when any of those calls set it. `flush` reads whatever it needs as it is by then.
+ */
+export function batched<T extends Record<string, boolean | undefined>>(flush: (due: T) => void, wait = 0): { add(what: T): void; stop(): void } {
+  let due: Record<string, boolean | undefined> | undefined;
+  let timer: NodeJS.Timeout | undefined;
+  return {
+    add(what) {
+      due ??= {};
+      for (const [k, v] of Object.entries(what)) due[k] ||= v;
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const now = due as T;
+        due = undefined;
+        timer = undefined;
+        flush(now);
+      }, wait);
+    },
+    stop() {
+      clearTimeout(timer);
+      timer = undefined;
+      due = undefined;
+    },
+  };
+}
+
+/** The branch a checkout is on, or undefined (detached, or not a git checkout). */
+function branchOf(dir: string): string | undefined {
+  try {
+    const b = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).trim();
+    return b && b !== 'HEAD' ? b : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** How long after a PR list or a worker's change the office looks for workers whose PR merged. */
@@ -76,6 +148,8 @@ const LANDED_DELAY_MS = 1500;
 /** Boards on a floor nobody is on, with nothing running, are asked GitHub about this seldom. */
 const IDLE_REFRESH_MS = 10 * 60_000;
 const REFRESH_MS = 90_000;
+/** How long the boards wait for the floor's other repositories' lists before everyone hears (see boardsChanged). */
+const BOARDS_WAIT_MS = 250;
 
 /** What `git` says about a checkout: its name, branch and origin for the top bar. */
 export function projectInfo(dir: string, name: string, agentCmd: string, agentArgs: string[]): ProjectInfo {
@@ -99,13 +173,17 @@ export function projectInfo(dir: string, name: string, agentCmd: string, agentAr
 
 /**
  * One floor of the building: a project's checkout with its own desks and workers, issues and PR
- * boards, task queue, pictures and jukebox, all kept in that checkout's .agent-office folder.
+ * boards, task queue, pictures and jukebox, all kept in that checkout's .agent-office folder. Other
+ * repositories' checkouts can be linked to it (see FloorLink): workers are hired in those too, and
+ * their issues and pull requests are on the boards with the floor's own. The task queue, the meeting
+ * room and the board agents work in the floor's own checkout.
  */
 export class Floor {
   readonly id: string;
   readonly dir: string;
   readonly project: ProjectInfo;
   readonly workers: WorkerManager;
+  /** The floor's own repository's issues and pull requests (see boards for every repository's). */
   readonly github: GitHub;
   readonly queue: TaskQueue;
   readonly changes: Changes;
@@ -123,8 +201,12 @@ export class Floor {
   /** The basketball by the hoop: who has it, or how it was last thrown. */
   readonly court = new Court();
   private timer: NodeJS.Timeout;
-  /** Pull requests merging, to ring the gong for. */
-  private merges = new MergeWatch();
+  /** Each of the floor's repositories, its own first (see setLinks). */
+  private boards: Board[] = [];
+  /** The linked checkouts as the elevator shows them. */
+  private linkInfo: FloorLinkInfo[] = [];
+  /** Boards that changed since everyone last heard (see boardsChanged). */
+  private boardFlush = batched<BoardChange>((due) => this.flushBoards(due), BOARDS_WAIT_MS);
   /** A look for workers whose pull request merged, due shortly (see sendLandedHome). */
   private landedTimer?: NodeJS.Timeout;
   /** Workers across repositories whose worktrees are being checked before they go home. */
@@ -182,25 +264,15 @@ export class Floor {
       ctx.capacity,
       ctx.prompts,
       ctx.runAs,
+      undefined,
+      def.links ?? [],
     );
 
-    this.github = new GitHub(
-      def.dir,
-      (state) => ctx.emit(this, { t: 'gh.issues', state }),
-      (state) => {
-        ctx.emit(this, { t: 'gh.pulls', state });
-        this.queue?.onPulls(state.items);
-        if (state.loading || state.error) return;
-        // A worker may have opened one from a branch it made itself, mid-turn or from a shell.
-        void this.workers.syncBranches();
-        for (const p of this.merges.look(state.items)) {
-          ctx.toast(this, `🎉 PR #${p.number} merged: ${p.title}`);
-          this.merged(p.number);
-        }
-        this.sendLandedHome();
-        ctx.pullsChanged(this);
-      },
-    );
+    const own = this.board({ id: '', name: def.name, repo: def.repo, dir: def.dir });
+    this.github = own.github;
+    this.boards = [own];
+    for (const l of def.links ?? []) this.boards.push(this.board(l));
+    this.linkInfo = this.describeLinks(def.links ?? []);
     // The 📋 task queue seats workers by itself: it watches the workers and links PRs from GitHub.
     this.queue = new TaskQueue(dataDir, this.workers, !!this.project.branch, {
       update: (state) => {
@@ -259,9 +331,21 @@ export class Floor {
       (workerId, repo) => {
         const w = this.workers.get(workerId);
         if (!w) return undefined;
-        if (!repo) return { name: w.name, cwd: w.worktree ? path.join(def.dir, w.worktree.path) : def.dir, rel: w.worktree?.path ?? '', worktreeBase: w.worktree?.base };
-        // One of the other floors' repositories it works in: diffed against, and PRs opened against, that floor's branch.
-        const r = w.repos?.find((x) => x.floor === repo);
+        if (!repo) {
+          const own = { name: w.name, cwd: w.worktree ? path.join(def.dir, w.worktree.path) : def.dir, rel: w.worktree?.path ?? '', worktreeBase: w.worktree?.base };
+          // In a linked checkout: diffed against, and PRs opened against, that repository's branch.
+          const b = w.checkout ? this.boards.find((x) => x.checkout === w.checkout) : undefined;
+          if (!b) return own;
+          return {
+            ...own,
+            cwd: w.worktree ? own.cwd : b.dir,
+            baseBranch: w.worktree?.from ?? branchOf(b.dir) ?? null,
+            openPull: (branch) => openPull(this.pullsOf(b.checkout), branch),
+            refreshGitHub: () => void b.github.refresh(),
+          };
+        }
+        // One of the other repositories it works in: diffed against, and PRs opened against, that repository's branch.
+        const r = w.repos?.find((x) => repoKey(x) === repo);
         if (!r) return undefined;
         const other = ctx.floor(r.floor);
         return {
@@ -270,11 +354,11 @@ export class Floor {
           rel: r.path,
           worktreeBase: r.base,
           baseBranch: r.from ?? null,
-          openPull: (branch) => (other ? openPull(other, branch) : undefined),
-          refreshGitHub: () => void other?.github.refresh(),
+          openPull: (branch) => (other ? openPull(other.pullsOf(r.checkout), branch) : undefined),
+          refreshGitHub: () => void other?.boardOf(r.checkout)?.refresh(),
         };
       },
-      (branch) => openPull(this, branch),
+      (branch) => openPull(this.pullsOf(undefined), branch),
       {
         state: (state, ids) => ctx.changes(state, ids),
         toast: (text, level) => ctx.toast(this, text, level),
@@ -287,16 +371,111 @@ export class Floor {
     this.whiteboard = new Whiteboard(dataDir);
     this.ready = this.workers.start();
 
-    void this.github.refresh();
+    void this.refresh();
     // A floor with people on it, or work under way, keeps its boards fresh; the others check in now and then.
     this.timer = setInterval(() => {
-      if (this.active() || Date.now() - this.github.issues.fetchedAt > IDLE_REFRESH_MS) void this.github.refresh();
+      if (this.active() || Date.now() - this.github.issues.fetchedAt > IDLE_REFRESH_MS) void this.refresh();
     }, REFRESH_MS);
   }
 
-  /** Pull request `n` merged (`by` someone, from the PR window): the gong rings, once per PR. */
-  merged(n: number, by?: string) {
-    if (this.merges.ring(n)) this.ctx.emit(this, { t: 'gong', why: 'merged', pr: n, by });
+  /** A repository's issues and PRs, the floor's own when `link` has no id. */
+  private board(link: Pick<FloorLink, 'id' | 'name' | 'repo' | 'dir'>): Board {
+    const b: Board = { checkout: link.id || undefined, name: link.name, repo: link.repo, dir: link.dir, github: undefined!, merges: new MergeWatch() };
+    b.github = new GitHub(
+      link.dir,
+      () => this.boardsChanged({ issues: true }),
+      (state) => {
+        // The queue seats its workers in the floor's own checkout.
+        if (!b.checkout) this.queue?.onPulls(state.items);
+        if (state.loading || state.error) return this.boardsChanged({ pulls: true });
+        for (const p of b.merges.look(state.items)) {
+          this.ctx.toast(this, `🎉 PR #${p.number} merged${b.checkout ? ` in ${b.repo ?? b.name}` : ''}: ${p.title}`);
+          this.merged(p.number, undefined, b.checkout);
+        }
+        this.boardsChanged({ pulls: true, settled: true });
+      },
+    );
+    return b;
+  }
+
+  /**
+   * One of the boards changed: everyone on the floor hears about every repository's lists at once,
+   * once they've been quiet for a moment (BOARDS_WAIT_MS), once for all the boards that changed in the meantime (each repository's refresh
+   * lands on its own). With `settled`, a list of pull requests came in: the workers' branches and
+   * merged PRs are looked at again then too, once.
+   */
+  private boardsChanged(what: BoardChange) {
+    this.boardFlush.add(what);
+  }
+
+  private flushBoards(due: BoardChange) {
+    if (due.issues) this.ctx.emit(this, { t: 'gh.issues', state: this.issues() });
+    if (due.pulls) this.ctx.emit(this, { t: 'gh.pulls', state: this.pulls() });
+    if (!due.settled) return;
+    // A worker may have opened one from a branch it made itself, mid-turn or from a shell.
+    void this.workers.syncBranches();
+    this.sendLandedHome();
+    this.ctx.pullsChanged(this);
+  }
+
+  /** The linked checkouts as the elevator shows them, with the branch each is on. */
+  private describeLinks(links: FloorLink[]): FloorLinkInfo[] {
+    return links.map((l) => ({ id: l.id, name: l.name, repo: l.repo, dir: l.dir, branch: branchOf(l.dir), addedBy: l.addedBy, addedAt: l.addedAt }));
+  }
+
+  /**
+   * The checkouts linked to this floor changed (see Building.link): their boards come and go, and the
+   * workers can be hired in (and Claude sessions are seated from) the ones there are now.
+   */
+  setLinks(links: FloorLink[]) {
+    const next: Board[] = [this.boards[0]];
+    for (const l of links) {
+      const had = this.boards.find((b) => b.checkout === l.id);
+      const b = had ?? this.board(l);
+      next.push(b);
+      if (!had) void b.github.refresh();
+    }
+    for (const b of this.boards) if (!next.includes(b)) b.github.stop();
+    this.boards = next;
+    this.linkInfo = this.describeLinks(links);
+    this.workers.setLinks(links);
+    this.boardsChanged({ issues: true, pulls: true });
+  }
+
+  /** A repository's issues and PRs on this floor: `checkout` names a linked one, none the floor's own. */
+  boardOf(checkout: string | undefined): GitHub | undefined {
+    return this.boards.find((b) => b.checkout === checkout)?.github;
+  }
+
+  /** Every repository's issues on this floor, for its board (see gather). */
+  issues(): GhState<GhIssue> {
+    return this.gather((g) => g.issues);
+  }
+
+  /** Every repository's pull requests on this floor, for its board (see gather). */
+  pulls(): GhState<GhPull> {
+    return this.gather((g) => g.pulls);
+  }
+
+  /** One repository's pull requests (`checkout` as for boardOf), labelled as on the board. */
+  pullsOf(checkout: string | undefined): GhPull[] {
+    return this.pulls().items.filter((p) => p.checkout === checkout);
+  }
+
+  /** Every repository's list as one, for the boards (see gatherBoards). */
+  private gather<T extends GhIssue | GhPull>(of: (g: GitHub) => GhState<T>): GhState<T> {
+    return gatherBoards(this.boards.map((b) => ({ checkout: b.checkout, label: b.repo ?? b.name, state: of(b.github) })));
+  }
+
+  /** Every repository's issues and PRs on this floor, asked of GitHub again. */
+  refresh(): Promise<void> {
+    return Promise.all(this.boards.map((b) => b.github.refresh())).then(() => undefined);
+  }
+
+  /** Pull request `n` merged (`by` someone, from the PR window), in a linked checkout's repository with `checkout`: the gong rings, once per PR. */
+  merged(n: number, by?: string, checkout?: string) {
+    const b = this.boards.find((x) => x.checkout === checkout);
+    if (b?.merges.ring(n)) this.ctx.emit(this, { t: 'gong', why: 'merged', pr: n, by, checkout });
   }
 
   /**
@@ -310,8 +489,14 @@ export class Floor {
     this.landedTimer = setTimeout(() => {
       this.landedTimer = undefined;
       if (!this.ctx.leaveOnMerge()) return;
-      const pullsOf = (id: string) => this.ctx.floor(id)?.github.pulls.items;
-      for (const landed of landedWorkers(this.workers.list(), this.github.pulls.items, this.queue.state().tasks, pullsOf)) {
+      const pullsOf = (key: string) => {
+        const { floor, checkout } = splitRepoKey(key);
+        return this.ctx.floor(floor)?.pullsOf(checkout);
+      };
+      // Each worker's own pull requests are in the repository it works in.
+      const workers = this.workers.list();
+      const tasks = this.queue.state().tasks;
+      for (const landed of this.boards.flatMap((b) => landedWorkers(workers.filter((w) => w.checkout === b.checkout), this.pullsOf(b.checkout), tasks, pullsOf))) {
         const { worker, head, heads } = landed;
         if (!worker.repos?.length) {
           this.goHome(worker, `PR #${landed.pr} merged`, head);
@@ -340,7 +525,7 @@ export class Floor {
 
   /** Someone just walked in: boards that haven't been looked at in a while get fetched again. */
   arrived() {
-    if (Date.now() - Math.max(this.github.issues.fetchedAt, this.github.pulls.fetchedAt) > REFRESH_MS) void this.github.refresh();
+    if (Date.now() - Math.max(this.github.issues.fetchedAt, this.github.pulls.fetchedAt) > REFRESH_MS) void this.refresh();
   }
 
   private active(): boolean {
@@ -362,6 +547,7 @@ export class Floor {
       busy: ws.filter((w) => w.status === 'working').length,
       waiting: ws.filter((w) => w.kind === 'agent' && (w.status === 'needs_input' || (w.status === 'done' && !w.acked))).length,
       people: this.ctx.people(this),
+      links: this.linkInfo.length ? this.linkInfo : undefined,
     };
   }
 
@@ -369,8 +555,9 @@ export class Floor {
   shutdown(keep = false) {
     clearInterval(this.timer);
     clearTimeout(this.landedTimer);
+    this.boardFlush.stop();
     this.dog.stop();
-    this.github.stop();
+    for (const b of this.boards) b.github.stop();
     this.queue.shutdown();
     this.meetings.shutdown();
     this.changes.stop();

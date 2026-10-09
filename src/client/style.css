@@ -809,6 +809,9 @@ a.when:hover { text-decoration: underline; }
 .modal label.repo-pick { display: inline-flex; gap: 5px; align-items: center; margin: 0; padding: 2px 10px 2px 6px; border: 2px solid var(--ink); border-radius: 999px; background: #fff; cursor: pointer; font-weight: 800; }
 .modal label.repo-pick:has(input:checked) { border-color: var(--accent); background: var(--paper-2); }
 .repo-pick input { margin: 0; accent-color: var(--accent); }
+.modal label.checkout-pick { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; font-size: 13px; font-weight: 800; }
+.checkout-pick > span { color: var(--muted); }
+.checkout-pick select { font: inherit; padding: 3px 8px; border: 2px solid var(--ink); border-radius: 9px; background: #fff; }
 /* O at the desk of a worker across repositories: a row per repository. */
 .repo-pulls { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .repo-pulls li { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: 3px solid var(--ink); border-radius: 12px; background: #fff; font-weight: 800; }
@@ -1023,6 +1026,7 @@ a.when:hover { text-decoration: underline; }
 .queue-limit .btn { padding: 1px 9px; font-size: 15px; }
 .queue-limit b { min-width: 58px; text-align: center; color: var(--ink); font-size: 15px; }
 .queue-empty { margin-top: 16px; text-align: center; padding: 18px 8px; border: 3px dashed var(--muted); border-radius: 14px; font-weight: 800; }
+.repo-chip { padding: 1px 6px; border-radius: 999px; border: 1.5px solid var(--ink); background: #fff; color: var(--ink); font-size: 10px; font-weight: 900; white-space: nowrap; }
 .qchip { padding: 1px 6px; border-radius: 999px; border: 1.5px solid var(--ink); background: #e0f2fe; color: var(--ink); font-size: 10px; font-weight: 900; }
 .qchip.running { background: #d8f5e3; }
 .qchip.done { background: #fff1de; }
@@ -1067,6 +1071,13 @@ a.when:hover { text-decoration: underline; }
 .elevator .floor-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: stretch; }
 .elevator .floor-off { padding: 0 12px; font-size: 16px; }
 .elevator .floor-off:hover { background: #ffe3d6; }
+.elevator .floor-links { display: flex; flex-direction: column; gap: 4px; margin: 4px 0 2px 44px; }
+.elevator .floor-link { display: flex; align-items: center; gap: 8px; padding: 2px 4px 2px 10px; border-left: 3px solid var(--muted); font-size: 13px; }
+.elevator .floor-link .nm { font-weight: 800; white-space: nowrap; }
+.elevator .floor-link .desc { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.elevator .floor-link .link-off { padding: 1px 8px; font-size: 13px; }
+.elevator .floor-links .link-add { align-self: flex-start; padding: 2px 10px; font-size: 12px; }
+.elevator .floor-links .link-add.on { background: var(--accent); color: var(--accent-ink); }
 .elevator .floor-no { width: 34px; height: 34px; border-radius: 50%; border: 3px solid var(--ink); display: grid; place-items: center; font-weight: 900; font-size: 15px; color: #fff; text-shadow: 0 1px 0 rgba(0, 0, 0, .35); }
 .elevator .floor-text { display: flex; flex-direction: column; min-width: 0; }
 .elevator .floor-name { font-weight: 900; font-size: 15px; display: flex; gap: 8px; align-items: baseline; }
@@ -1086,6 +1097,11 @@ a.when:hover { text-decoration: underline; }
 .elevator .repo .nm { font-weight: 800; white-space: nowrap; }
 .elevator .repo .desc { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .elevator .repo .when { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.elevator .repo.floored { cursor: default; opacity: .65; }
+.elevator .repo .pill.live { white-space: nowrap; }
+.elevator .add-tabs { margin-bottom: 8px; }
+.elevator .add-tabs .btn { padding: 4px 12px; font-size: 13px; }
+.elevator .path-add { margin-top: 8px; }
 .elevator .note { margin: 8px 0 0; font-size: 12px; font-weight: 700; color: var(--muted); overflow-wrap: anywhere; }
 .elevator .note.busy { color: var(--ink); }
 .elevator .dir-change { margin-left: 6px; padding: 1px 8px; font-size: 12px; border-width: 2px; border-radius: 9px; box-shadow: 0 2px 0 var(--ink); vertical-align: baseline; }

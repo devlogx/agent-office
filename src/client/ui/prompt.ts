@@ -17,9 +17,26 @@ export interface PromptOptions {
   worktreeOption?: boolean;
   /** Offer the configured agent provider choice (only when hiring a new worker). */
   providerOption?: boolean;
-  /** Other floors' projects a new worker in its own worktree can work in too (see WorkerInfo.repos). */
+  /** Other projects a new worker in its own worktree can work in too (see WorkerInfo.repos), by repoKey. */
   repoOptions?: { id: string; name: string }[];
-  onSubmit(text: string, opts: { worktree: boolean; provider?: AgentProvider; model?: string; effort?: AgentEffort; repos: string[] }): void;
+  /** On a floor with more than one repository: the checkouts a new worker can be hired in (see checkoutPicker). */
+  checkoutOptions?: CheckoutChoice[];
+  onSubmit(text: string, opts: { worktree: boolean; provider?: AgentProvider; model?: string; effort?: AgentEffort; repos: string[]; checkout?: string }): void;
+}
+
+/** One of the floor's checkouts a new worker can be hired in (see WorkerInfo.checkout): `id` '' is the floor's own; `key` its repoKey. */
+export interface CheckoutChoice {
+  id: string;
+  name: string;
+  key: string;
+}
+
+/** The "🗂️ Also work in" choices, which can leave one out: the checkout the worker is hired in. */
+export interface RepoPicker {
+  element: HTMLElement | null;
+  value(): string[];
+  /** Never offers the repository with this repoKey (unticked, greyed out); the others are offered again. */
+  exclude(key: string | undefined): void;
 }
 
 const WT_KEY = 'agent-office.worktree';
@@ -37,18 +54,47 @@ export function worktreePref(): boolean {
  * of its own on the same branch. That needs a worktree of its own here, so picking one ticks `wtBox`
  * and unticking that clears them.
  */
-export function repoPicker(options: { id: string; name: string }[] | undefined, wtBox: HTMLInputElement): { element: HTMLElement | null; value(): string[] } {
+export function repoPicker(options: { id: string; name: string }[] | undefined, wtBox: HTMLInputElement, without?: string): RepoPicker {
   const picks = (options ?? []).map((r) => {
     const box = h('input', { type: 'checkbox', value: r.id, onchange: () => box.checked && (wtBox.checked = true) }) as HTMLInputElement;
     return { id: r.id, box, el: h('label.repo-pick', { title: `A worktree of ${r.name} too, on the same branch, with a pull request of its own` }, box, r.name) };
   });
-  if (!picks.length) return { element: null, value: () => [] };
+  const exclude = (key: string | undefined) => {
+    for (const p of picks) {
+      const out = p.id === key;
+      if (out) p.box.checked = false;
+      p.box.disabled = out;
+      p.el.classList.toggle('hidden', out);
+    }
+  };
+  // Nothing but the checkout it's hired in: nothing else to offer.
+  if (!picks.some((p) => p.id !== without)) return { element: null, value: () => [], exclude: () => undefined };
   wtBox.addEventListener('change', () => {
     if (!wtBox.checked) for (const p of picks) p.box.checked = false;
   });
+  exclude(without);
   return {
     element: h('div.repo-picks', { role: 'group', 'aria-label': 'Other projects to work in' }, h('span', {}, '🗂️ Also work in'), ...picks.map((p) => p.el)),
-    value: () => picks.filter((p) => p.box.checked).map((p) => p.id),
+    value: () => picks.filter((p) => p.box.checked && !p.box.disabled).map((p) => p.id),
+    exclude,
+  };
+}
+
+/**
+ * On a floor with more than one repository: which of them a new worker works in, the floor's own
+ * first (see WorkerInfo.checkout). Its worktree is cut from that one, and "Also work in" (`repos`)
+ * stops offering it. Undefined value: the floor's own.
+ */
+export function checkoutPicker(options: CheckoutChoice[] | undefined, repos: RepoPicker, initial = ''): { element: HTMLElement | null; value(): string | undefined } {
+  if (!options || options.length < 2) return { element: null, value: () => (initial || undefined) };
+  const select = h('select', { 'aria-label': 'Repository to work in' }, ...options.map((o) => h('option', { value: o.id }, o.name))) as HTMLSelectElement;
+  select.value = options.some((o) => o.id === initial) ? initial : '';
+  const key = () => options.find((o) => o.id === select.value)?.key;
+  select.addEventListener('change', () => repos.exclude(key()));
+  repos.exclude(key());
+  return {
+    element: h('label.checkout-pick', { title: 'Which of this floor’s repositories it works in: its worktree, terminal and pull request are there' }, h('span', {}, '📁 Works in'), select),
+    value: () => select.value || undefined,
   };
 }
 
@@ -66,6 +112,7 @@ export function openPrompt(opts: PromptOptions) {
     )
     : null;
   const repos = repoPicker(opts.worktreeOption ? opts.repoOptions : undefined, wtBox);
+  const checkout = checkoutPicker(opts.checkoutOptions, repos);
   const provider: ProviderPicker | null = opts.providerOption ? providerPicker(store.project, 'prompt-provider') : null;
   const submit = h('button.btn.primary', { type: 'submit' }, opts.submitLabel ?? 'Send ✨');
   const cancel = h('button.btn', { type: 'button' }, 'Cancel');
@@ -73,7 +120,7 @@ export function openPrompt(opts: PromptOptions) {
     'form.modal',
     { role: 'dialog', 'aria-label': opts.title },
     h('header', {}, h('h2', {}, opts.title)),
-    h('div.body', {}, opts.warning ? h('p.setting-note.bad', { style: 'margin:0 0 10px', role: 'alert' }, opts.warning) : null, opts.subtitle ? h('p', { style: 'margin:0 0 10px;font-weight:700;color:var(--muted)' }, opts.subtitle) : null, ta, provider?.element ?? null, wtRow, repos.element),
+    h('div.body', {}, opts.warning ? h('p.setting-note.bad', { style: 'margin:0 0 10px', role: 'alert' }, opts.warning) : null, opts.subtitle ? h('p', { style: 'margin:0 0 10px;font-weight:700;color:var(--muted)' }, opts.subtitle) : null, ta, provider?.element ?? null, checkout.element, wtRow, repos.element),
     h('footer', {}, h('span.grow', {}, 'Enter to send · Shift+Enter for a new line'), cancel, submit),
   ) as HTMLFormElement;
   form.noValidate = true;
@@ -96,7 +143,7 @@ export function openPrompt(opts: PromptOptions) {
       }
     }
     const worktree = !!opts.worktreeOption && wtBox.checked;
-    opts.onSubmit(text, { worktree, provider: provider?.value(), model: provider?.model(), effort: provider?.effort(), repos: worktree ? repos.value() : [] });
+    opts.onSubmit(text, { worktree, provider: provider?.value(), model: provider?.model(), effort: provider?.effort(), repos: worktree ? repos.value() : [], checkout: checkout.value() });
   };
   form.addEventListener('submit', (e) => {
     e.preventDefault();

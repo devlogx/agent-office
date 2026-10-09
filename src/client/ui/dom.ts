@@ -1,3 +1,5 @@
+import type { WorkerInfo } from '../../shared/protocol';
+
 type Attrs = Record<string, string | number | boolean | EventListener | undefined | null>;
 type Child = Node | string | number | null | undefined | false;
 
@@ -167,3 +169,8 @@ export const STATUS_LABEL: Record<string, string> = {
   exited: 'exited',
   offline: 'asleep',
 };
+
+/** What a worker's card says it's doing: a session in someone's own terminal says so (see WorkerInfo.external). */
+export function statusLabel(w: Pick<WorkerInfo, 'status' | 'external'>): string {
+  return w.external ? '🖥️ in your terminal' : (STATUS_LABEL[w.status] ?? w.status);
+}

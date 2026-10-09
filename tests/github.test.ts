@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MergeWatch } from '../src/server/github.js';
+import { MergeWatch, closesOwn } from '../src/server/github.js';
 import type { GhPull } from '../src/shared/protocol.js';
 
 const pull = (number: number, state: string): GhPull => ({
@@ -25,4 +25,12 @@ test('a merge from the PR window rings right away, and not again when GitHub cat
   // A look that started before the merge still says open; the next one says merged.
   assert.deepEqual(numbers(w.look([pull(5, 'OPEN'), pull(6, 'OPEN')])), []);
   assert.deepEqual(numbers(w.look([pull(5, 'MERGED'), pull(6, 'MERGED')])), [6]);
+});
+
+test("a pull request only closes its own repository's issues on the board, not another one's with the same number", () => {
+  const ref = (number: number, owner: string, name: string) => ({ number, url: `https://github.com/${owner}/${name}/issues/${number}`, repository: { name, owner: { login: owner } } });
+  const p = { url: 'https://github.com/acme/feyer/pull/3', closingIssuesReferences: [ref(12, 'acme', 'feyer'), ref(7, 'acme', 'feyer-app'), { number: 9, url: 'https://github.com/Acme/Feyer/issues/9' }] };
+  assert.deepEqual(closesOwn(p), [12, 9]);
+  assert.deepEqual(closesOwn({ url: '', closingIssuesReferences: [{ number: 4 }] }), [4], "nothing to tell by: the PR's own");
+  assert.deepEqual(closesOwn({ url: 'https://github.com/acme/feyer/pull/3' }), []);
 });

@@ -13,36 +13,55 @@ import { providerPicker } from './provider';
 // reviews, line comments, checks) with a Files tab for the diff, where you tick files off as
 // reviewed; from here you comment, label, merge or close it, or hand it to a worker to review, fix up and merge.
 
-/** The board windows ask about the floor you're on. */
-function onFloor(url: string): string {
-  return store.floor ? `${url}${url.includes('?') ? '&' : '?'}floor=${encodeURIComponent(store.floor)}` : url;
+/**
+ * The board windows ask about the floor you're on, and about the repository the issue or PR is in
+ * when it's one linked to the floor (`checkout`, see GhIssue.checkout).
+ */
+function onFloor(url: string, checkout?: string): string {
+  const q = [store.floor && `floor=${encodeURIComponent(store.floor)}`, checkout && `checkout=${encodeURIComponent(checkout)}`].filter(Boolean).join('&');
+  return q ? `${url}${url.includes('?') ? '&' : '?'}${q}` : url;
 }
 
-async function getJson<T>(url: string): Promise<T> {
-  const r = await fetch(onFloor(url), { credentials: 'same-origin' });
+async function getJson<T>(url: string, checkout?: string): Promise<T> {
+  const r = await fetch(onFloor(url, checkout), { credentials: 'same-origin' });
   if (!r.ok) throw new Error((await r.json().catch(() => null))?.error ?? `HTTP ${r.status}`);
   return r.json() as Promise<T>;
 }
 
-async function getText(url: string): Promise<string> {
-  const r = await fetch(onFloor(url), { credentials: 'same-origin' });
+async function getText(url: string, checkout?: string): Promise<string> {
+  const r = await fetch(onFloor(url, checkout), { credentials: 'same-origin' });
   if (!r.ok) throw new Error((await r.json().catch(() => null))?.error ?? `HTTP ${r.status}`);
   return r.text();
 }
 
-const mergeWaiters = new Map<number, (msg: Extract<ServerMsg, { t: 'gh.merged' }>) => void>();
+/**
+ * Names an issue or PR on the floor's boards, as "issue:<checkout>:N" or "pull:<checkout>:N": on a
+ * floor with more than one repository, numbers are only unique within one (see GhIssue.checkout).
+ */
+function itemKey(kind: 'issue' | 'pull', it: { number: number; checkout?: string }): string {
+  return `${kind}:${it.checkout ?? ''}:${it.number}`;
+}
+
+/** Open merge dialogs, by itemKey. */
+const mergeWaiters = new Map<string, (msg: Extract<ServerMsg, { t: 'gh.merged' }>) => void>();
+/** Comment boxes waiting on GitHub, by itemKey. */
 const commentWaiters = new Map<string, (msg: Extract<ServerMsg, { t: 'gh.commented' }>) => void>();
-/** Open close dialogs, by "issue:N" or "pull:N". */
+/** Open close dialogs, by itemKey. */
 const closeWaiters = new Map<string, (msg: Extract<ServerMsg, { t: 'gh.closed' }>) => void>();
-/** Open label pickers, by "issue:N" or "pull:N". */
+/** Open label pickers, by itemKey. */
 const labelWaiters = new Map<string, (msg: Extract<ServerMsg, { t: 'gh.labeled' }>) => void>();
 
 /** Main feeds server messages through here so an open merge, close or label dialog or comment box hears back. */
 export function routePullMessage(msg: ServerMsg) {
-  if (msg.t === 'gh.merged') mergeWaiters.get(msg.number)?.(msg);
-  if (msg.t === 'gh.commented') commentWaiters.get(`${msg.kind}#${msg.number}`)?.(msg);
-  if (msg.t === 'gh.closed') closeWaiters.get(`${msg.kind}:${msg.number}`)?.(msg);
-  if (msg.t === 'gh.labeled') labelWaiters.get(`${msg.kind}:${msg.number}`)?.(msg);
+  if (msg.t === 'gh.merged') mergeWaiters.get(itemKey('pull', msg))?.(msg);
+  if (msg.t === 'gh.commented') commentWaiters.get(itemKey(msg.kind, msg))?.(msg);
+  if (msg.t === 'gh.closed') closeWaiters.get(itemKey(msg.kind, msg))?.(msg);
+  if (msg.t === 'gh.labeled') labelWaiters.get(itemKey(msg.kind, msg))?.(msg);
+}
+
+/** The same issue or PR, in the same repository of the floor's. */
+function same(a: { number: number; checkout?: string }, b: { number: number; checkout?: string }): boolean {
+  return a.number === b.number && a.checkout === b.checkout;
 }
 
 function pref<T>(key: string, fallback: T): T {
@@ -202,9 +221,9 @@ interface CommentBox {
  * as that account rather than as you. The draft is kept per item until it is posted, so Esc or a
  * closed window doesn't lose it.
  */
-function commentBox(kind: 'issue' | 'pull', number: number, itemUrl: string, net: Net, onPosted: (c: GhComment) => void): CommentBox {
+function commentBox(kind: 'issue' | 'pull', number: number, checkout: string | undefined, itemUrl: string, net: Net, onPosted: (c: GhComment) => void): CommentBox {
   const draftKey = `${DRAFT_KEY}${itemUrl}`;
-  const waitKey = `${kind}#${number}`;
+  const waitKey = itemKey(kind, { number, checkout });
   let busy = false;
   let timer = 0;
   const ta = h('textarea', { rows: 4, placeholder: 'Leave a comment. Markdown works; ⌘/Ctrl+Enter posts it.', 'aria-label': 'Comment' }) as HTMLTextAreaElement;
@@ -277,7 +296,7 @@ function commentBox(kind: 'issue' | 'pull', number: number, itemUrl: string, net
       fail('No answer from the office. Reload the conversation to see whether the comment went through before posting it again.');
       sync();
     }, 45_000);
-    net.send({ t: 'gh.comment', kind, number, body });
+    net.send({ t: 'gh.comment', kind, number, body, checkout });
   };
 
   ta.addEventListener('input', () => (saveDraft(), sync()));
@@ -390,7 +409,8 @@ function openMerge(it: GhPull, d: GhPullDetail, net: Net, handToWorker: () => vo
   renderMethods();
   if (!st.can) go.disabled = true;
 
-  const modal = openModal(el, { onClose: () => mergeWaiters.delete(it.number) });
+  const key = itemKey('pull', it);
+  const modal = openModal(el, { onClose: () => mergeWaiters.delete(key) });
   cancel.addEventListener('click', () => modal.close());
   worker.addEventListener('click', () => {
     modal.close();
@@ -402,8 +422,8 @@ function openMerge(it: GhPull, d: GhPullDetail, net: Net, handToWorker: () => vo
     go.disabled = true;
     result.className = 'gh-merge-result';
     result.replaceChildren(h('span.spinner'), auto.checked && st.auto ? 'Asking GitHub to merge it when ready…' : 'Merging…');
-    mergeWaiters.set(it.number, (msg) => {
-      mergeWaiters.delete(it.number);
+    mergeWaiters.set(key, (msg) => {
+      mergeWaiters.delete(key);
       busy = false;
       if (msg.error) {
         go.disabled = false;
@@ -414,7 +434,7 @@ function openMerge(it: GhPull, d: GhPullDetail, net: Net, handToWorker: () => vo
       modal.close();
       onMerged();
     });
-    net.send({ t: 'gh.merge', number: it.number, method, deleteBranch, auto: auto.checked && st.auto });
+    net.send({ t: 'gh.merge', number: it.number, method, deleteBranch, auto: auto.checked && st.auto, checkout: it.checkout });
   });
   setTimeout(() => (st.can ? go : cancel).focus(), 30);
 }
@@ -425,7 +445,7 @@ const REASON_LABEL: Record<GhCloseReason, string> = { completed: '✅ Completed'
 
 /** Closes an issue (as completed or not planned) or a PR without merging, with an optional comment. */
 function openClose(kind: 'issue' | 'pull', it: GhIssue | GhPull, net: Net, onClosed: () => void) {
-  const key = `${kind}:${it.number}`;
+  const key = itemKey(kind, it);
   const pull = kind === 'pull' ? (it as GhPull) : null;
   let reason: GhCloseReason = 'completed';
   let busy = false;
@@ -482,7 +502,7 @@ function openClose(kind: 'issue' | 'pull', it: GhIssue | GhPull, net: Net, onClo
       modal.close();
       onClosed();
     });
-    net.send({ t: 'gh.close', kind, number: it.number, comment: comment.value.trim() || undefined, reason: pull ? undefined : reason, deleteBranch: !!pull && del.checked });
+    net.send({ t: 'gh.close', kind, number: it.number, comment: comment.value.trim() || undefined, reason: pull ? undefined : reason, deleteBranch: !!pull && del.checked, checkout: it.checkout });
   });
   setTimeout(() => comment.focus(), 30);
 }
@@ -494,7 +514,7 @@ function openClose(kind: 'issue' | 'pull', it: GhIssue | GhPull, net: Net, onClo
  * then save, and the office's gh account adds and takes off the difference.
  */
 export function openLabels(kind: 'issue' | 'pull', it: GhIssue | GhPull, net: Net, onSaved?: (labels: GhLabel[]) => void) {
-  const key = `${kind}:${it.number}`;
+  const key = itemKey(kind, it);
   const had = new Set(it.labels.map((l) => l.name));
   const on = new Set(had);
   const noun = kind === 'pull' ? 'PR' : 'issue';
@@ -571,7 +591,7 @@ export function openLabels(kind: 'issue' | 'pull', it: GhIssue | GhPull, net: Ne
     error = '';
     repo = null;
     render();
-    getJson<GhLabel[]>('/api/gh/labels')
+    getJson<GhLabel[]>('/api/gh/labels', it.checkout)
       .then((l) => (repo = l))
       .catch((err) => (error = (err as Error).message))
       .finally(render);
@@ -604,7 +624,7 @@ export function openLabels(kind: 'issue' | 'pull', it: GhIssue | GhPull, net: Ne
       settle();
       fail('No answer from the office. Look at the board to see whether the labels changed before saving again.');
     }, 45_000);
-    net.send({ t: 'gh.labels', kind, number: it.number, add, remove });
+    net.send({ t: 'gh.labels', kind, number: it.number, add, remove, checkout: it.checkout });
   };
 
   filter.addEventListener('input', applyFilter);
@@ -660,7 +680,7 @@ export function openPull(first: GhPull, net: Net, actions: BoardActions) {
   // The comment box stays put while the conversation above it is redrawn, so a load finishing
   // doesn't take the focus (or the text) away from someone typing.
   const thread = h('div.gh-items');
-  const comment = commentBox('pull', it.number, itemUrl, net, (c) => {
+  const comment = commentBox('pull', it.number, it.checkout, itemUrl, net, (c) => {
     if (!detail) return loadAll();
     detail.comments.push(c);
     renderConv();
@@ -681,8 +701,8 @@ export function openPull(first: GhPull, net: Net, actions: BoardActions) {
 
   const handToWorker = () => {
     const p = mergePref(detail?.repo.methods ?? ['squash', 'merge', 'rebase']);
-    if (detail && conflicted(detail)) actions.assign(fixConflictsPrompt(it, p.method, p.deleteBranch), `Fix conflicts & merge PR #${it.number}`);
-    else actions.assign(fixAndMergePrompt(it, p.method, p.deleteBranch), `Fix up & merge PR #${it.number}`);
+    if (detail && conflicted(detail)) actions.assign(fixConflictsPrompt(it, p.method, p.deleteBranch), `Fix conflicts & merge PR #${it.number}`, it.checkout);
+    else actions.assign(fixAndMergePrompt(it, p.method, p.deleteBranch), `Fix up & merge PR #${it.number}`, it.checkout);
   };
 
   const renderFrame = () => {
@@ -724,9 +744,10 @@ export function openPull(first: GhPull, net: Net, actions: BoardActions) {
     footBtns.replaceChildren(
       ...nodes(
       w ? h('button.btn', { type: 'button', onclick: () => actions.goToDesk(w.deskId) }, `🪑 Go to ${w.name}'s desk`) : null,
-      h('button.btn', { type: 'button', title: 'Send a worker your own prompt about this PR', onclick: () => actions.ask(pullContext(it), `Ask about PR #${it.number}`) }, '✍️ Ask a worker…'),
-      isOpen ? h('button.btn', { type: 'button', onclick: () => actions.assign(reviewPrompt(it), `Review PR #${it.number}`) }, '🔍 Review') : null,
-      isOpen
+      h('button.btn', { type: 'button', title: 'Send a worker your own prompt about this PR', onclick: () => actions.ask(pullContext(it), `Ask about PR #${it.number}`, it.checkout) }, '✍️ Ask a worker…'),
+      isOpen ? h('button.btn', { type: 'button', onclick: () => actions.assign(reviewPrompt(it), `Review PR #${it.number}`, it.checkout) }, '🔍 Review') : null,
+      // The meeting room works in the floor's own checkout.
+      isOpen && !it.checkout
         ? h('button.btn', { type: 'button', title: 'A few workers review it in the meeting room, each through its own lens, and the office posts one combined review', onclick: () => actions.meeting({ pattern: 'review', pr: it.number, title: `Review of PR #${it.number}`, prompt: officePrompt('pull.panel', pullVars(it)) }) }, '🤝 Review panel…')
         : null,
       conflicts
@@ -1089,7 +1110,7 @@ export function openPull(first: GhPull, net: Net, actions: BoardActions) {
     detailError = '';
     diffError = '';
     renderConv();
-    getJson<GhPullDetail>(`/api/gh/pull?number=${it.number}`)
+    getJson<GhPullDetail>(`/api/gh/pull?number=${it.number}`, it.checkout)
       .then((d) => {
         if (g !== generation) return;
         detail = d;
@@ -1100,7 +1121,7 @@ export function openPull(first: GhPull, net: Net, actions: BoardActions) {
       })
       .catch((err) => g === generation && (detailError = (err as Error).message))
       .finally(() => g === generation && (renderFrame(), renderConv()));
-    getText(`/api/gh/pull/diff?number=${it.number}`)
+    getText(`/api/gh/pull/diff?number=${it.number}`, it.checkout)
       .then((text) => {
         if (g !== generation) return;
         files = parseDiff(text);
@@ -1115,7 +1136,7 @@ export function openPull(first: GhPull, net: Net, actions: BoardActions) {
   });
 
   const unsub = store.on('pulls', () => {
-    const fresh = store.pulls.items.find((p) => p.number === it.number);
+    const fresh = store.pulls.items.find((p) => same(p, it));
     if (!fresh) return;
     it = detail ? { ...fresh, state: fresh.state === 'OPEN' ? detail.state : fresh.state } : fresh;
     renderFrame();
@@ -1145,7 +1166,7 @@ export function openIssue(first: GhIssue, net: Net, actions: BoardActions) {
   const pill = h('span.pill');
   const conv = h('div.gh-conv');
   const thread = h('div.gh-items');
-  const comment = commentBox('issue', it.number, itemUrl, net, (c) => {
+  const comment = commentBox('issue', it.number, it.checkout, itemUrl, net, (c) => {
     if (!detail) return load();
     detail.comments.push(c);
     render();
@@ -1173,13 +1194,14 @@ export function openIssue(first: GhIssue, net: Net, actions: BoardActions) {
       'footer',
       {},
       h('a.grow', { href: it.url, target: '_blank', rel: 'noopener noreferrer' }, 'Open on GitHub ↗'),
-      h('button.btn', { type: 'button', title: 'Send a worker your own prompt about this issue', onclick: () => actions.ask(issueContext(it), `Ask about issue #${it.number}`) }, '✍️ Ask a worker…'),
-      h('button.btn', { type: 'button', title: 'Workers take it on together in the meeting room: a debate, lead & team, map-reduce or red / blue', onclick: () => actions.meeting(issueMeeting(it.number, it.title)) }, '🤝 Meeting…'),
+      h('button.btn', { type: 'button', title: 'Send a worker your own prompt about this issue', onclick: () => actions.ask(issueContext(it), `Ask about issue #${it.number}`, it.checkout) }, '✍️ Ask a worker…'),
+      // The meeting room, the queue and the cards on the cork board are the floor's own repository's.
+      it.checkout ? null : h('button.btn', { type: 'button', title: 'Workers take it on together in the meeting room: a debate, lead & team, map-reduce or red / blue', onclick: () => actions.meeting(issueMeeting(it.number, it.title)) }, '🤝 Meeting…'),
       closeIssue,
       queueProvider.element,
       queue,
       pickUp,
-      h('button.btn.primary', { type: 'button', onclick: () => actions.assign(issuePrompt(it), `Hand issue #${it.number} to a worker`) }, '🤖 Hand to a worker'),
+      h('button.btn.primary', { type: 'button', onclick: () => actions.assign(issuePrompt(it), `Hand issue #${it.number} to a worker`, it.checkout) }, '🤖 Hand to a worker'),
     ),
   );
   const renderFrame = () => {
@@ -1196,12 +1218,14 @@ export function openIssue(first: GhIssue, net: Net, actions: BoardActions) {
     );
     pill.className = `pill ${isOpen ? 'done' : 'offline'}`;
     pill.textContent = isOpen ? 'open' : 'closed';
-    const task = store.taskForIssue(it.number);
+    const task = it.checkout ? undefined : store.taskForIssue(it.number);
     const onQueue = !!task && task.status !== 'done';
+    // In a repository linked to the floor: no queue, and no card to carry (see GhIssue.checkout).
+    const own = !it.checkout;
     closeIssue.classList.toggle('hidden', !isOpen);
-    pickUp.classList.toggle('hidden', !isOpen);
-    queueProvider.element.classList.toggle('hidden', !isOpen || onQueue);
-    queue.classList.toggle('hidden', !isOpen);
+    pickUp.classList.toggle('hidden', !isOpen || !own);
+    queueProvider.element.classList.toggle('hidden', !isOpen || onQueue || !own);
+    queue.classList.toggle('hidden', !isOpen || !own);
     queue.disabled = onQueue;
     queue.title = onQueue ? '' : 'A worker picks it up by itself when a desk is free and there is room under the worker limit';
     queue.textContent = onQueue ? (task!.status === 'running' ? `🤖 ${task!.workerName ?? 'A worker'} is on it` : '📋 On the queue') : '📋 Add to queue';
@@ -1218,7 +1242,7 @@ export function openIssue(first: GhIssue, net: Net, actions: BoardActions) {
     const g = ++generation;
     error = '';
     render();
-    getJson<GhIssueDetail>(`/api/gh/issue?number=${it.number}`)
+    getJson<GhIssueDetail>(`/api/gh/issue?number=${it.number}`, it.checkout)
       .then((d) => {
         if (g !== generation) return;
         detail = d;
@@ -1230,7 +1254,7 @@ export function openIssue(first: GhIssue, net: Net, actions: BoardActions) {
   }
   const unsubs = [
     store.on('issues', () => {
-      const fresh = store.issues.items.find((i) => i.number === it.number);
+      const fresh = store.issues.items.find((i) => same(i, it));
       if (!fresh) return;
       // The board can lag behind a close made from here.
       it = detail ? { ...fresh, state: fresh.state === 'OPEN' ? detail.state : fresh.state } : fresh;

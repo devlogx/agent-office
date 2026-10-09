@@ -135,12 +135,30 @@ export interface WorkerInfo {
   lastInput?: { by: string; at: number };
   /** The meeting it was called to, for a worker at the meeting room's table (see Meeting). */
   meeting?: string;
+  /**
+   * A Claude Code session running in someone's own terminal on the office's machine, in this floor's
+   * checkout, rather than one the office runs (see server/sessions.ts). It sits at a desk so everyone
+   * can see it's there, but the office has no terminal of it and never starts, stops or wakes it:
+   * its status stays 'offline'. 'worker.takeOver' carries the conversation on in the office instead;
+   * once the session ends in the terminal it's an ordinary sleeping worker, R resuming it. `pid` is
+   * the terminal's Claude process, `since` when that session started (ms).
+   */
+  external?: { pid: number; since: number };
+  /**
+   * Which of its floor's linked checkouts it works in (FloorLink.id), on a floor with more than one
+   * repository; none for the floor's own checkout. Its worktree is cut from that repository (and
+   * still kept in the floor's .agent-office/worktrees), its terminal runs there without one, and its
+   * pull request, Changes window and PR badge are that repository's.
+   */
+  checkout?: string;
 }
 
 /** Another floor's repository a worker also works in (see WorkerInfo.repos): a worktree of it in the worker's workspace. */
 export interface WorkerRepo {
   /** The floor whose project it is. */
   floor: string;
+  /** One of that floor's linked checkouts (FloorLink.id) rather than its own; that floor can be the worker's own. */
+  checkout?: string;
   /** Its folder in the workspace, named after its checkout ("api"). */
   name: string;
   /** owner/name on GitHub, when known. */
@@ -326,6 +344,10 @@ export interface GhIssue {
   updatedAt: string;
   body: string;
   comments: number;
+  /** On a floor with more than one repository: which one it's in (owner/name, or the folder's name), for its label. */
+  repo?: string;
+  /** In one of the floor's linked checkouts (FloorLink.id) rather than its own: numbers are only unique per repository. */
+  checkout?: string;
 }
 
 export interface GhPull {
@@ -349,6 +371,10 @@ export interface GhPull {
   body: string;
   /** Issues it closes ("closes #12" in its description), as GitHub links them. */
   closes: number[];
+  /** As GhIssue.repo. */
+  repo?: string;
+  /** As GhIssue.checkout. */
+  checkout?: string;
 }
 
 export type TaskStatus = 'queued' | 'running' | 'done';
@@ -455,7 +481,7 @@ export interface Meeting {
   lastRound?: number;
   /** The current step's parts. */
   turns: MeetingTurn[];
-  /** Tokens every worker in the meeting may use between them, and how many they have. */
+  /** Tokens every worker in the meeting may use between them (0 = no limit), and how many they have. */
   budget: number;
   tokens: number;
   /** USD, where the providers report it. */
@@ -692,6 +718,28 @@ export interface FloorInfo {
   /** Workers waiting on someone: a question, a permission, or a finished turn nobody looked at. */
   waiting: number;
   people: number;
+  /** Other repositories' checkouts on this floor, besides its own (see FloorLink). */
+  links?: FloorLinkInfo[];
+}
+
+/**
+ * Another checkout on a floor besides its own (feyer-app next to feyer, say): its workers can be hired
+ * there, Claude sessions in a terminal there sit at the floor's desks, and its issues and PRs are on
+ * the floor's boards.
+ */
+export interface FloorLinkInfo {
+  /** Unique on its floor. */
+  id: string;
+  /** Its folder's name. */
+  name: string;
+  /** owner/name on GitHub, when its origin is there. */
+  repo?: string;
+  /** Its folder on the office's machine. */
+  dir: string;
+  /** The branch it's on, when it's a git checkout that isn't detached. */
+  branch?: string;
+  addedBy: string;
+  addedAt: number;
 }
 
 /** Where the elevator's "add a project" clones to: <dir>/<owner>/<repo> on the office's machine. */
@@ -712,6 +760,24 @@ export interface RepoChoice {
   private: boolean;
   /** ISO time of the last push. */
   pushedAt?: string;
+}
+
+/** A git checkout already on the office's machine, under the projects folder, for the elevator's "add a project". */
+export interface LocalCheckout {
+  /** The folder, absolute (what 'floor.addLocal' takes). */
+  dir: string;
+  /** For showing people: under the home folder it's ~/…. */
+  shown: string;
+  /** Its folder's name, which a floor made from it is called. */
+  name: string;
+  /** owner/name on GitHub, when its origin is there. */
+  repo?: string;
+  /** It's a floor already. */
+  floored: boolean;
+  /** The floor it's on, as that floor's own checkout or one linked to it (see FloorLinkInfo), by id. */
+  on?: string;
+  /** Claude Code sessions running in it right now, in someone's terminal (see server/sessions.ts). */
+  sessions: number;
 }
 
 /** Everything that belongs to the floor you're on: sent when you walk in, and when you change floors. */
@@ -1060,15 +1126,31 @@ export type ClientMsg =
   | { t: 'profile'; name: string; color: string; look: Look }
   /** With `issue`, the worker is there for that GitHub issue: it's assigned on GitHub (so it moves to In progress) and taken off the queue. */
   /** With `repos` (other floors' ids), the worker works in their repositories too, each in a worktree of its own (see WorkerInfo.repos). */
-  | { t: 'worker.spawn'; deskId: string; prompt?: string; worktree?: boolean; kind?: WorkerKind; provider?: AgentProvider; model?: string; effort?: AgentEffort; issue?: number; repos?: string[] }
+  /**
+   * With `checkout` (a FloorLink.id) the worker works in that linked checkout instead of the floor's own
+   * (see WorkerInfo.checkout), and `issue` is that repository's. `repos` can also name this floor's
+   * other checkouts, as `<floor>` or `<floor>:<link>` (see repoKey).
+   */
+  | { t: 'worker.spawn'; deskId: string; prompt?: string; worktree?: boolean; kind?: WorkerKind; provider?: AgentProvider; model?: string; effort?: AgentEffort; issue?: number; repos?: string[]; checkout?: string }
   | { t: 'worker.resume'; workerId: string }
-  | { t: 'worker.kill'; workerId: string; cleanup?: WorktreeCleanup }
+  /**
+   * Carry a session from someone's terminal (WorkerInfo.external) on in the office, with `claude --resume`
+   * (admins only). While that terminal's Claude is still running, only with `force`: whoever asked
+   * confirmed they'll close it there.
+   */
+  | { t: 'worker.takeOver'; workerId: string; force?: boolean }
+  /**
+   * With `forget` (admins), a worker whose repository is off its floor (see WorkerInfo.checkout) goes
+   * without its worktree being looked at: the worktree and branch stay on disk, for `agent-office prune`.
+   */
+  | { t: 'worker.kill'; workerId: string; cleanup?: WorktreeCleanup; forget?: boolean }
   /** Asks what the worker's worktree holds; answered with a `worker.worktree` message. */
   | { t: 'worker.worktree'; workerId: string }
   | { t: 'worker.attach'; workerId: string }
   | { t: 'worker.detach'; workerId: string }
   /** With `issue`, the prompt hands the worker that GitHub issue, which is taken as for worker.spawn. */
-  | { t: 'worker.prompt'; workerId: string; prompt: string; issue?: number }
+  /** `checkout`: which of the floor's repositories `issue` is in (see GhIssue.checkout). */
+  | { t: 'worker.prompt'; workerId: string; prompt: string; issue?: number; checkout?: string }
   /**
    * A prompt for the agent standing by a board (`deskId` is its kiosk, see STATIONS in layout). It's
    * typed into its session, which is woken up first if it's asleep, or hired there when nobody is.
@@ -1084,17 +1166,17 @@ export type ClientMsg =
   | { t: 'doing'; what?: string; reading?: boolean }
   | { t: 'gh.refresh' }
   /** Merge a pull request; the answer comes back as gh.merged. */
-  | { t: 'gh.merge'; number: number; method: GhMergeMethod; deleteBranch: boolean; auto?: boolean }
+  | { t: 'gh.merge'; number: number; method: GhMergeMethod; deleteBranch: boolean; auto?: boolean; checkout?: string }
   /** Comment on an issue or a PR's conversation, as the server's gh account; answered with gh.commented. */
-  | { t: 'gh.comment'; kind: 'issue' | 'pull'; number: number; body: string }
+  | { t: 'gh.comment'; kind: 'issue' | 'pull'; number: number; body: string; checkout?: string }
   /** Hit the office gong (E at the gong); everyone on the floor hears it. */
   | { t: 'gong' }
   /** Blow the DJ's air horn on the roof; everyone up there hears it. */
   | { t: 'horn' }
   /** Close an issue, or a pull request without merging it; the answer comes back as gh.closed. */
-  | { t: 'gh.close'; kind: 'issue' | 'pull'; number: number; comment?: string; reason?: GhCloseReason; deleteBranch?: boolean }
+  | { t: 'gh.close'; kind: 'issue' | 'pull'; number: number; comment?: string; reason?: GhCloseReason; deleteBranch?: boolean; checkout?: string }
   /** Put labels on an issue or PR and take others off, as the server's gh account; answered with gh.labeled. */
-  | { t: 'gh.labels'; kind: 'issue' | 'pull'; number: number; add: string[]; remove: string[] }
+  | { t: 'gh.labels'; kind: 'issue' | 'pull'; number: number; add: string[]; remove: string[]; checkout?: string }
   | { t: 'queue.add'; prompt: string; title?: string; issue?: number; provider?: AgentProvider; model?: string; effort?: AgentEffort }
   | { t: 'queue.remove'; taskId: string }
   /** Move a queued task up (-1) or down (+1) the queue. */
@@ -1196,6 +1278,17 @@ export type ClientMsg =
   | { t: 'floor.repos'; refresh?: boolean }
   /** Clone a repository and make it a new floor; answered with `floor.added` once it's there. */
   | { t: 'floor.add'; repo: string }
+  /** The git checkouts already in the projects folder that could become a floor (admins only); answered with `floor.local`. */
+  | { t: 'floor.local' }
+  /** Make a checkout already on the office's machine a floor, where it is (admins only); answered with `floor.added`, its `repo` being this `dir`. */
+  | { t: 'floor.addLocal'; dir: string }
+  /**
+   * Add another repository's checkout to a floor (admins only): `target` is a folder on the office's
+   * machine, or owner/name to find in the projects folder or clone there. Answered with `floor.linked`.
+   */
+  | { t: 'floor.link'; floor: string; target: string }
+  /** Take a linked checkout off its floor (admins only); refused while workers work in it. Its folder stays where it is. */
+  | { t: 'floor.unlink'; floor: string; link: string }
   /** Take a floor off the building (admins only). Its checkout stays on disk; everyone on it rides to another floor. */
   | { t: 'floor.remove'; floor: string }
   /** Dress the building up for a holiday, take the decorations down ('off'), or follow the calendar ('auto'). */
@@ -1252,8 +1345,12 @@ export type ServerMsg =
   | { t: 'floors'; floors: FloorInfo[] }
   /** Sent to whoever asked. */
   | { t: 'floor.repos'; repos: RepoChoice[]; error?: string }
+  /** Sent to whoever asked. */
+  | { t: 'floor.local'; checkouts: LocalCheckout[]; error?: string }
   /** Sent to whoever asked for the floor, once it's cloned (or couldn't be). */
   | { t: 'floor.added'; repo: string; floor?: string; error?: string }
+  /** Sent to whoever linked a checkout to a floor ('floor.link'), once it's there (or couldn't be); `target` as they sent it. */
+  | { t: 'floor.linked'; floor: string; target: string; link?: string; error?: string }
   /** The projects folder moved (see floor.projectsDir). */
   | { t: 'projectsDir'; state: ProjectsDirState }
   | { t: 'peer.join'; peer: PeerInfo }
@@ -1277,20 +1374,21 @@ export type ServerMsg =
   | { t: 'gh.issues'; state: GhState<GhIssue> }
   | { t: 'gh.pulls'; state: GhState<GhPull> }
   /** Sent to whoever asked for the merge. */
-  | { t: 'gh.merged'; number: number; error?: string }
+  | { t: 'gh.merged'; number: number; checkout?: string; error?: string }
   /** Sent to whoever commented: the comment as GitHub saved it, or why it wasn't. */
-  | { t: 'gh.commented'; kind: 'issue' | 'pull'; number: number; comment?: GhComment; error?: string }
+  | { t: 'gh.commented'; kind: 'issue' | 'pull'; number: number; checkout?: string; comment?: GhComment; error?: string }
   /**
    * The gong rings, for everyone on the floor: someone hit it, pull request `pr` merged (confetti
    * over the desk it came from), or the last task on the queue just finished (a bigger party).
    */
-  | { t: 'gong'; why: GongWhy; by?: string; pr?: number }
+  /** `checkout`: the linked checkout whose repository `pr` merged in, when it isn't the floor's own (see GhPull.checkout). */
+  | { t: 'gong'; why: GongWhy; by?: string; pr?: number; checkout?: string }
   /** Someone on the roof blew the DJ's air horn (sent to everyone up there, them too). */
   | { t: 'horn'; by: string }
   /** Sent to whoever asked to close it. */
-  | { t: 'gh.closed'; kind: 'issue' | 'pull'; number: number; error?: string }
+  | { t: 'gh.closed'; kind: 'issue' | 'pull'; number: number; checkout?: string; error?: string }
   /** Sent to whoever changed them: the labels it has now, or why they didn't change. */
-  | { t: 'gh.labeled'; kind: 'issue' | 'pull'; number: number; labels?: GhLabel[]; error?: string }
+  | { t: 'gh.labeled'; kind: 'issue' | 'pull'; number: number; checkout?: string; labels?: GhLabel[]; error?: string }
   | { t: 'rtc'; from: string; data: unknown }
   | ({ t: 'chat' } & ChatLine)
   | { t: 'toast'; text: string; level: 'info' | 'warn' | 'error' }

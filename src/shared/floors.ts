@@ -56,3 +56,17 @@ export function normalizeRepo(value: unknown): string | undefined {
 export function sameRepo(a: string | undefined, b: string | undefined): boolean {
   return !!a && !!b && a.toLowerCase() === b.toLowerCase();
 }
+
+/**
+ * Names one checkout across the building: a floor's own as its id, one linked to it (see FloorLink)
+ * as `<floor>:<link>`. What a worker across repositories keys each of its repositories by.
+ */
+export function repoKey(r: { floor: string; checkout?: string }): string {
+  return r.checkout ? `${r.floor}:${r.checkout}` : r.floor;
+}
+
+/** The floor and linked checkout (none: the floor's own) a repoKey names. */
+export function splitRepoKey(key: string): { floor: string; checkout?: string } {
+  const at = key.indexOf(':');
+  return at < 0 ? { floor: key } : { floor: key.slice(0, at), checkout: key.slice(at + 1) || undefined };
+}

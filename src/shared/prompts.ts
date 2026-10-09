@@ -80,7 +80,13 @@ const station = (kind: StationKind): PromptDef => ({
 
 // --- Placeholders several prompts share -----------------------------------------------------------
 
-const ISSUE_VARS = { number: 'The issue number', title: 'The issue title', url: 'Its page on GitHub' };
+const ISSUE_VARS = {
+  number: 'The issue number',
+  title: 'The issue title',
+  url: 'Its page on GitHub',
+  ref: 'The issue as #12, or as owner/name#12 on a floor with more than one repository (the worker may be in another one)',
+  repoFlag: '“ --repo owner/name” on a floor with more than one repository, else nothing: for gh issue view',
+};
 const PULL_VARS = { number: 'The pull request number', title: 'Its title', url: 'Its page on GitHub', branch: 'Its branch', base: 'The branch it merges into' };
 const MERGE_VARS = { ...PULL_VARS, repo: 'owner/name of the repository', merge: 'The gh pr merge command for the method (and branch deletion) picked in the merge dialog' };
 const CHECKOUT = 'Get onto its branch: `gh pr checkout {{number}}`. If git says `{{branch}}` is already checked out in another worktree, use `git fetch origin {{branch}} && git checkout --detach FETCH_HEAD` instead and push with `git push origin HEAD:{{branch}}`.';
@@ -95,7 +101,7 @@ const DEFS = {
     label: '🤖 Hand to a worker',
     used: 'The task a worker gets for an issue: 🤖 Hand to a worker, 📋 Add to queue, and a card carried to a desk or the queue.',
     vars: ISSUE_VARS,
-    text: 'Work on GitHub issue #{{number}}: "{{title}}".\n\nRead it first with `gh issue view {{number}} --comments`. Create a new branch, implement the change, verify it, then open a pull request that closes #{{number}}.',
+    text: 'Work on GitHub issue {{ref}}: "{{title}}".\n\nRead it first with `gh issue view {{number}}{{repoFlag}} --comments`. Create a new branch, implement the change, verify it, then open a pull request that closes {{ref}}.',
   },
   'issue.ask': {
     group: 'issues',
@@ -103,14 +109,14 @@ const DEFS = {
     used: 'Told to the worker ahead of your own words when you ✍️ Ask a worker about an issue.',
     vars: ISSUE_VARS,
     optional: true,
-    text: 'This is about GitHub issue #{{number}} "{{title}}" ({{url}}). Read it with `gh issue view {{number}} --comments`.',
+    text: 'This is about GitHub issue {{ref}} "{{title}}" ({{url}}). Read it with `gh issue view {{number}}{{repoFlag}} --comments`.',
   },
   'issue.meeting': {
     group: 'issues',
     label: '🤝 Meeting about it',
     used: 'What a 🤝 Meeting about an issue is about, to start with: the meeting form opens with it filled in.',
     vars: ISSUE_VARS,
-    text: 'GitHub issue #{{number}}: “{{title}}”. Read it first with gh issue view {{number}} --comments.',
+    text: 'GitHub issue {{ref}}: “{{title}}”. Read it first with gh issue view {{number}}{{repoFlag}} --comments.',
   },
 
   // --- 🔀 Pull requests board ---
@@ -226,7 +232,7 @@ const DEFS = {
       output: "The output file, as it's named in the project",
       outputPath: 'The output file, by its full path',
       rounds: 'The round limit: "3 rounds"',
-      budget: 'The token budget for the whole table: "300k"',
+      budget: 'The token budget for the whole table: "300k tokens", or "no token limit"',
       where: 'What they may and may not do in the checkout (commit, push, switch branches)',
     },
     text: [
@@ -235,7 +241,7 @@ const DEFS = {
       'What the meeting is about:\n{{about}}',
       '{{pullRequest}}',
       '{{issue}}',
-      'How it runs: the office hands each of you your part of every round in a message like this one. Do just that part, write it to the file it names, and end your turn; the next round starts once every part of this one is written. Your working directory is {{cwd}}, and every file of the meeting is in it: the notes go in {{notes}}/, which is where you read what the others wrote. The meeting ends when {{output}} ({{outputPath}}) is written, and only the part that says so writes it. It has {{rounds}} at most and {{budget}} tokens between all of you, so keep your notes short: bullets over prose.',
+      'How it runs: the office hands each of you your part of every round in a message like this one. Do just that part, write it to the file it names, and end your turn; the next round starts once every part of this one is written. Your working directory is {{cwd}}, and every file of the meeting is in it: the notes go in {{notes}}/, which is where you read what the others wrote. The meeting ends when {{output}} ({{outputPath}}) is written, and only the part that says so writes it. It has {{rounds}} at most and {{budget}} between all of you, so keep your notes short: bullets over prose.',
       '{{where}}',
     ].join('\n\n'),
   },

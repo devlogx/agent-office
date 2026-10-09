@@ -45,6 +45,29 @@ function checksOf(rollup: any[]): GhPull['checks'] {
   return pending ? 'pending' : 'pass';
 }
 
+/** owner/name of the repository a GitHub URL (an issue's, a pull request's) is in, lower-cased. */
+function repoOfUrl(url: unknown): string | undefined {
+  return typeof url === 'string' ? /github\.com\/([^/]+\/[^/]+)\//i.exec(url)?.[1]?.toLowerCase() : undefined;
+}
+
+/**
+ * The issues a pull request closes in its own repository, from GitHub's closingIssuesReferences: one
+ * in another repository ("closes acme/api#12") has the same kind of number, and isn't this board's.
+ */
+export function closesOwn(p: { url?: unknown; closingIssuesReferences?: unknown }): number[] {
+  const own = repoOfUrl(p.url);
+  const refs = Array.isArray(p.closingIssuesReferences) ? (p.closingIssuesReferences as any[]) : [];
+  return refs
+    .filter((r) => {
+      const repo = r?.repository;
+      const theirs = (typeof repo?.nameWithOwner === 'string' ? repo.nameWithOwner : repo?.owner?.login && repo?.name ? `${repo.owner.login}/${repo.name}` : undefined)?.toLowerCase() ?? repoOfUrl(r?.url);
+      // Nothing to tell by: as before, it's taken to be this repository's.
+      return !own || !theirs || theirs === own;
+    })
+    .map((r) => Number(r?.number))
+    .filter((n) => Number.isInteger(n) && n > 0);
+}
+
 const FAILED = ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'];
 
 /** One entry of statusCheckRollup: a CheckRun (Actions) or a StatusContext (other CI). */
@@ -425,7 +448,7 @@ export class GitHub {
         deletions: p.deletions ?? 0,
         checks: checksOf(p.statusCheckRollup),
         body: String(p.body ?? '').slice(0, 4000),
-        closes: (p.closingIssuesReferences ?? []).map((r: any) => Number(r.number)).filter((n: number) => Number.isInteger(n) && n > 0),
+        closes: closesOwn(p),
       }));
       const items = this.relabel('pull', fetched, asked);
       this.pulls = { items, fetchedAt: Date.now(), loading: false };

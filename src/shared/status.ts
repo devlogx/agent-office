@@ -29,9 +29,11 @@ export interface WorkerPr {
 /**
  * Where its work stands on GitHub: a pull request from its desk, its worktree branch or its queue
  * task is open (one still open wins, e.g. a follow-up on the same branch), or merged, so it can be
- * sent home. Undefined when it has none, or only closed ones.
+ * sent home. Undefined when it has none, or only closed ones. On a floor with more than one
+ * repository only its own checkout's pull requests count (see WorkerInfo.checkout).
  */
 export function workerPr(w: WorkerInfo, pulls: GhPull[], tasks: QueueTask[]): WorkerPr | undefined {
+  pulls = pulls.filter((p) => p.checkout === w.checkout);
   const mine = new Set<number>();
   if (w.pr) mine.add(w.pr.number);
   for (const t of tasks) if (t.workerId === w.id && t.pr) mine.add(t.pr.number);

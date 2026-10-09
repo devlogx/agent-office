@@ -37,8 +37,13 @@ test('every default only uses placeholders it says it has, and names the ones th
 
 test('the boards send what they always did', () => {
   assert.equal(
-    fillPrompt(PROMPTS['issue.work'].text, { number: 7, title: 'Dog barks', url: 'u' }),
+    fillPrompt(PROMPTS['issue.work'].text, { number: 7, title: 'Dog barks', url: 'u', ref: '#7', repoFlag: '' }),
     'Work on GitHub issue #7: "Dog barks".\n\nRead it first with `gh issue view 7 --comments`. Create a new branch, implement the change, verify it, then open a pull request that closes #7.',
+  );
+  // On a floor with more than one repository the issue says which one it's in, whichever the worker is hired in.
+  assert.equal(
+    fillPrompt(PROMPTS['issue.work'].text, { number: 7, title: 'Dog barks', url: 'u', ref: 'acme/feyer-app#7', repoFlag: ' --repo acme/feyer-app' }),
+    'Work on GitHub issue acme/feyer-app#7: "Dog barks".\n\nRead it first with `gh issue view 7 --repo acme/feyer-app --comments`. Create a new branch, implement the change, verify it, then open a pull request that closes acme/feyer-app#7.',
   );
   const merge = fillPrompt(PROMPTS['pull.fixMerge'].text, { number: 5, title: 'T', url: 'https://github.com/o/r/pull/5', branch: 'feat', base: 'main', repo: 'o/r', merge: 'gh pr merge 5 --squash --repo o/r' });
   assert.match(merge, /^Get pull request #5 "T" \(https:\/\/github\.com\/o\/r\/pull\/5\) ready and merge it\.\n\n1\. Get onto its branch: `gh pr checkout 5`\. If git says `feat` is already checked out/);

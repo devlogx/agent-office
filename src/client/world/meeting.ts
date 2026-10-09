@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { MEETING_PATTERNS, meetingSummary } from '../../shared/meetings';
+import { MEETING_PATTERNS, NO_MEETING_BUDGET, meetingBudgetLabel, meetingSummary } from '../../shared/meetings';
 import { fmtCost, fmtTokens, type Meeting, type MeetingState } from '../../shared/protocol';
 
 const FONT = 'Nunito, ui-rounded, system-ui, sans-serif';
@@ -187,7 +187,7 @@ export class MeetingSignTexture {
       const who = speaking(m);
       if (who.length) lines(`💬 ${who.join(', ')}`, `700 30px ${FONT}`, '#bde0fe', y + 8, 3, 38);
       // The budget, as a bar that fills up, and what's been spent.
-      const f = Math.min(1, m.tokens / Math.max(1, m.budget));
+      const f = m.budget > NO_MEETING_BUDGET ? Math.min(1, m.tokens / m.budget) : 0;
       const barY = H - 118;
       g.fillStyle = 'rgba(255,255,255,.18)';
       g.fillRect(pad, barY, W - 2 * pad, 20);
@@ -195,7 +195,7 @@ export class MeetingSignTexture {
       g.fillRect(pad, barY, (W - 2 * pad) * f, 20);
       g.fillStyle = '#fffaf3';
       g.font = `800 30px ${FONT}`;
-      g.fillText(`${fmtTokens(m.tokens)} of ${fmtTokens(m.budget)} tokens`, pad, H - 58);
+      g.fillText(m.budget > NO_MEETING_BUDGET ? `${fmtTokens(m.tokens)} of ${fmtTokens(m.budget)} tokens` : `${fmtTokens(m.tokens)} tokens · ${meetingBudgetLabel(m.budget)}`, pad, H - 58);
       g.font = `700 28px ${FONT}`;
       g.fillStyle = '#e9ecef';
       if (m.cost > 0) g.fillText(`${fmtCost(m.cost)}${m.costKnown ? '' : '+'} so far`, pad, H - 22);

@@ -9,7 +9,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import type { Config } from './config.js';
 import { Auth, type Session } from './auth.js';
 import { Accounts } from './accounts.js';
-import { MAX_REPOS, childEnv, resolveCommand, type RepoSource } from './workers.js';
+import { MAX_REPOS, childEnv, repoSources, resolveCommand } from './workers.js';
 import { SignIns, type GhAs } from './signins.js';
 import { agentProviders, configuredProvider, OPEN_CODE_MODEL_MAX } from './agents.js';
 import { createOpenCodeModelCatalogue } from './models.js';
@@ -23,6 +23,7 @@ import { PlanLimitsReader } from './limits.js';
 import { Webhook } from './webhook.js';
 import { MAX_WORKER_LIMIT, Machine, parseWorkerLimit } from './machine.js';
 import { Building, type FloorDef } from './building.js';
+import { liveClaudeSessions, pidAlive } from './sessions.js';
 import { Floor, type FloorContext } from './floor.js';
 import { Sky } from './sky.js';
 import { Themes } from './theme.js';
@@ -39,7 +40,7 @@ import { checkFrame, scoreText, type CabinetFrame, type CabinetState } from '../
 import { SEARCH_MAX, SEARCH_MIN, searchKey } from '../shared/search.js';
 import { WB_MAX_FILE_BYTES } from '../shared/whiteboard.js';
 import { DROP_MAX_BYTES } from '../shared/drops.js';
-import { MAX_FLOORS } from '../shared/floors.js';
+import { MAX_FLOORS, repoKey } from '../shared/floors.js';
 import { lookFromSeed, sanitizeLook } from '../shared/avatar.js';
 import { EMOTE_EVERY, EmoteBucket, isEmote } from '../shared/emotes.js';
 import { isThemePick } from '../shared/theme.js';
@@ -173,9 +174,15 @@ function send(res: http.ServerResponse, status: number, body: unknown, headers: 
   res.end(json);
 }
 
+/** How often the office looks for Claude Code sessions in someone's terminal in a floor's checkout (see syncTerminals). */
+const TERMINALS_MS = 5000;
 const str = (v: unknown, max: number) => (typeof v === 'string' ? v.slice(0, max) : '');
-/** Which of a worker's repositories a Changes message is about: another floor's (see WorkerInfo.repos), or none for its own. */
-const repoOf = (v: unknown) => str(v, 64) || undefined;
+/** Which of a worker's repositories a Changes message is about: another one's repoKey (see WorkerInfo.repos), or none for its own. */
+const repoOf = (v: unknown) => str(v, 100) || undefined;
+/** Which of a floor's linked checkouts a message is about (see FloorLink), or none for the floor's own. */
+const checkoutOf = (v: unknown) => str(v, 64) || undefined;
+/** Said when a message names a linked checkout its floor doesn't have (any more). */
+const NO_CHECKOUT = "That repository isn't on this floor any more";
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
 /** Where someone going to another floor says they arrive (see `floor.go`): on the grounds, or nowhere (the elevator). */
 function arrivalSpot(at: unknown): { x: number; y: number; z: number; rotY: number } | undefined {
@@ -455,7 +462,8 @@ export async function startServer(cfg: Config) {
     cfg.maxWorkers,
     () => {
       let n = 0;
-      for (const f of floors.values()) n += f.workers.list().length;
+      // Sessions in someone's own terminal (WorkerInfo.external) aren't the office's to run.
+      for (const f of floors.values()) n += f.workers.list().filter((w) => !w.external).length;
       return n;
     },
     (state) => broadcast({ t: 'machine', state }),
@@ -540,6 +548,18 @@ export async function startServer(cfg: Config) {
   for (const def of building.list()) openFloor(def);
   // Workers still running from the last office are back at their desks before anyone walks in.
   await Promise.all([...floors.values()].map((f) => f.ready));
+  /**
+   * The Claude Code sessions running in someone's own terminal in a floor's checkout sit at its desks
+   * too, saying so (see WorkerManager.syncTerminals): looked for now, every few seconds, and as a floor
+   * opens. One read of Claude's session registry covers every floor.
+   */
+  const syncTerminals = (only?: Floor) => {
+    // Null when the registry couldn't be read: each floor then leaves its terminals' workers as they are.
+    const live = liveClaudeSessions();
+    for (const f of only ? [only] : floors.values()) f.workers.syncTerminals(live);
+  };
+  syncTerminals();
+  const terminals = setInterval(() => syncTerminals(), TERMINALS_MS);
 
   const team = new Team(cfg.publicHost, cfg.port, cfg.tailnet);
   const tailnet = new Tailnet(cfg.tailnet);
@@ -591,8 +611,8 @@ export async function startServer(cfg: Config) {
     floor: floor?.id ?? null,
     project: floor?.project ?? null,
     workers: floor?.workers.list() ?? [],
-    issues: floor?.github.issues ?? { items: [], fetchedAt: 0, loading: false },
-    pulls: floor?.github.pulls ?? { items: [], fetchedAt: 0, loading: false },
+    issues: floor?.issues() ?? { items: [], fetchedAt: 0, loading: false },
+    pulls: floor?.pulls() ?? { items: [], fetchedAt: 0, loading: false },
     queue: floor?.queue.state() ?? { tasks: [], maxWorkers: 0 },
     decor: floor?.decor.list() ?? [],
     services: servicesState(floor),
@@ -898,7 +918,9 @@ export async function startServer(cfg: Config) {
         // The repo's labels (for the label picker) are the one thing not about a single issue or PR.
         if (p !== '/api/gh/labels' && (!Number.isSafeInteger(n) || n <= 0)) return send(res, 400, { error: 'Bad number' });
         if (!floor) return send(res, 404, { error: 'No such floor' });
-        const github = floor.github;
+        // Which of the floor's repositories: numbers are only unique within one.
+        const github = floor.boardOf(checkoutOf(url.searchParams.get('checkout')));
+        if (!github) return send(res, 404, { error: NO_CHECKOUT });
         try {
           // "You" on comments is your own GitHub login once you've signed in to it.
           const me = session.account ? signins.githubLogin(session.account.id) : undefined;
@@ -1217,12 +1239,16 @@ export async function startServer(cfg: Config) {
   /**
    * A worker took on GitHub issue `n` (an issue card dropped on its desk): assign it on GitHub, which
    * moves it to In progress on the board, and take it off the queue so nobody else is seated for it.
+   * `checkout` is the linked checkout whose repository it's in, if not the floor's own (the queue is
+   * only ever the floor's own repository's).
    */
-  const takeIssue = (c: Client, floor: Floor, n: number) => {
-    floor.queue.dropIssue(n);
+  const takeIssue = (c: Client, floor: Floor, n: number, checkout?: string) => {
+    if (!checkout) floor.queue.dropIssue(n);
+    const github = floor.boardOf(checkout);
+    if (!github) return warn(c, NO_CHECKOUT);
     const as = c.accountId ? signins.ghAs(c.accountId) : undefined;
     if (typeof as === 'string') return warn(c, `Couldn't assign issue #${n} on GitHub: ${as}`);
-    void floor.github.claim(n, as).then((err) => warn(c, err && `Couldn't assign issue #${n} on GitHub: ${err}`));
+    void github.claim(n, as).then((err) => warn(c, err && `Couldn't assign issue #${n} on GitHub: ${err}`));
   };
 
   /**
@@ -1248,9 +1274,10 @@ export async function startServer(cfg: Config) {
    * Worktrees.fetch): right away when that was just fetched, else after a fetch, if `c` and the floor
    * are still there.
    */
-  const withFreshBase = (c: Client, floor: Floor | Floor[], go: () => void) => {
+  const withFreshBase = (c: Client, floor: Floor | Floor[], go: () => void, checkouts: (string | undefined)[] = []) => {
     const all = Array.isArray(floor) ? floor : [floor];
-    const fetching = all.map((f) => f.workers.fetchBase()).filter((p) => p !== undefined);
+    // Each floor's checkout, or (`checkouts`, side by side with `floor`) one linked to it.
+    const fetching = all.map((f, i) => f.workers.fetchBase(checkouts[i])).filter((p) => p !== undefined);
     if (!fetching.length) return go();
     void Promise.all(fetching).then(() => {
       if (c.out || c.ws.readyState !== WebSocket.OPEN || all.some((f) => floors.get(f.id) !== f)) return;
@@ -1434,10 +1461,83 @@ export async function startServer(cfg: Config) {
             if (typeof r === 'string') return sendTo(c, { t: 'floor.added', repo, error: r });
             const floor = openFloor(r);
             if (!floor) return sendTo(c, { t: 'floor.added', repo, error: `Cloned ${r.repo}, but couldn't open its floor — see the office's log` });
+            void floor.ready.then(() => syncTerminals(floor));
             console.log(`  ${who} added a floor for ${r.repo} (${r.dir})`);
             toastAll(`🛗 New floor: ${r.name}, added by ${who}`);
             sendTo(c, { t: 'floor.added', repo, floor: floor.id });
           });
+        break;
+      }
+      case 'floor.local': {
+        // Folders on the office's machine: admins see them, as they pick the projects folder.
+        if (!meOf(c.accountId).admin) {
+          sendTo(c, { t: 'floor.local', checkouts: [], error: 'Only admins can make a floor of a folder on the office’s machine' });
+          break;
+        }
+        const found = building.localCheckouts(liveClaudeSessions() ?? []);
+        sendTo(c, typeof found === 'string' ? { t: 'floor.local', checkouts: [], error: found } : { t: 'floor.local', checkouts: found });
+        break;
+      }
+      case 'floor.addLocal': {
+        const dir = str(msg.dir, 1024);
+        const r = meOf(c.accountId).admin ? building.addLocal(dir, who) : 'Only admins can make a floor of a folder on the office’s machine';
+        floorsChanged();
+        if (typeof r === 'string') {
+          sendTo(c, { t: 'floor.added', repo: dir, error: r });
+          break;
+        }
+        const floor = openFloor(r);
+        if (!floor) {
+          sendTo(c, { t: 'floor.added', repo: dir, error: `Added ${r.dir}, but couldn't open its floor — see the office's log` });
+          break;
+        }
+        // Its workers from before it was taken off, if any, are back at their desks; then whoever's in a terminal there.
+        void floor.ready.then(() => syncTerminals(floor));
+        console.log(`  ${who} added a floor for ${r.dir}${r.repo ? ` (${r.repo})` : ''}`);
+        toastAll(`🛗 New floor: ${r.name}, added by ${who}`);
+        sendTo(c, { t: 'floor.added', repo: dir, floor: floor.id });
+        break;
+      }
+      case 'floor.link': {
+        // A folder on the office's machine, or a clone into it: admins, as for a floor of its own.
+        const id = str(msg.floor, 64);
+        const target = str(msg.target, 1024);
+        if (!meOf(c.accountId).admin) {
+          sendTo(c, { t: 'floor.linked', floor: id, target, error: 'Only admins can add a repository to a floor' });
+          break;
+        }
+        void building.link(id, target, who).then((r) => {
+          const floor = floors.get(id);
+          if (typeof r === 'string' || !floor) {
+            sendTo(c, { t: 'floor.linked', floor: id, target, error: typeof r === 'string' ? r : 'That floor is closed — its checkout is gone' });
+            return;
+          }
+          floor.setLinks(floor.def.links ?? []);
+          floorsChanged();
+          // Whoever's in a terminal there sits down now.
+          syncTerminals(floor);
+          console.log(`  ${who} added ${r.dir}${r.repo ? ` (${r.repo})` : ''} to the ${floor.def.name} floor`);
+          toastAll(`🗂️ ${who} added ${r.repo ?? r.name} to the ${floor.def.name} floor`);
+          sendTo(c, { t: 'floor.linked', floor: id, target, link: r.id });
+        });
+        break;
+      }
+      case 'floor.unlink': {
+        if (!meOf(c.accountId).admin) return warn(c, 'Only admins can take a repository off a floor');
+        const floor = floors.get(str(msg.floor, 64));
+        if (!floor) return warn(c, 'No such floor');
+        const linkId = str(msg.link, 64);
+        // Its workers would be left working in a repository the floor doesn't have.
+        const there = floor.workers.onCheckout(linkId);
+        const across = [...floors.values()].flatMap((f) => f.workers.list().filter((w) => w.repos?.some((r) => r.floor === floor.id && r.checkout === linkId)).map((w) => w.name));
+        const busy = [...there, ...across];
+        if (busy.length) return warn(c, `${busy.join(', ')} ${busy.length === 1 ? 'still works' : 'still work'} in that repository — send ${busy.length === 1 ? 'it' : 'them'} home first`);
+        const r = building.unlink(floor.id, linkId);
+        if (typeof r === 'string') return warn(c, r);
+        floor.setLinks(floor.def.links ?? []);
+        floorsChanged();
+        console.log(`  ${who} took ${r.dir} off the ${floor.def.name} floor (it stays where it is)`);
+        toastFloor(floor, `🗂️ ${who} took ${r.repo ?? r.name} off this floor`);
         break;
       }
       case 'floor.remove': {
@@ -1492,25 +1592,39 @@ export async function startServer(cfg: Config) {
         }
         const model = msg.model === undefined ? undefined : str(msg.model, OPEN_CODE_MODEL_MAX + 1);
         const effort = isAgentEffort(msg.effort) ? msg.effort : undefined;
-        // Other floors' projects to work in too, each in a worktree of its own.
-        const repos: RepoSource[] = [];
-        for (const id of Array.isArray(msg.repos) ? [...new Set(msg.repos.slice(0, MAX_REPOS + 1).map((x) => str(x, 64)))] : []) {
-          const other = floors.get(id);
-          if (!other || other === floor) return warn(c, other ? "The worker's own floor's project is already in its workspace" : 'That project is no longer in the building');
-          repos.push({ floor: other.id, name: other.def.name, repo: other.def.repo, dir: other.dir });
-        }
+        // One of the floor's linked checkouts to work in, instead of its own.
+        const checkout = checkoutOf(msg.checkout);
+        const link = checkout ? floor.def.links?.find((l) => l.id === checkout) : undefined;
+        if (checkout && !link) return warn(c, NO_CHECKOUT);
+        // Other projects to work in too, each in a worktree of its own: other floors' (or their linked
+        // checkouts), and this floor's other checkouts. Looked up again once their bases are fetched:
+        // one may have left the building meanwhile.
+        const own = repoKey({ floor: floor.id, checkout });
+        const keys = Array.isArray(msg.repos) ? [...new Set(msg.repos.slice(0, MAX_REPOS + 1).map((x) => str(x, 100)))] : [];
+        const resolve = () =>
+          repoSources(keys, own, (at) => {
+            const other = floors.get(at.floor);
+            return at.checkout ? other?.def.links?.find((l) => l.id === at.checkout) : other?.def;
+          });
+        const repos = resolve();
+        if (typeof repos === 'string') return warn(c, repos);
+        const name = link?.name ?? floor.def.name;
         // A shell is theirs too: `claude auth login` or `gh auth login` typed there signs them in.
         const hire = () => {
-          const r = floor.workers.spawn(str(msg.deskId, 32), who, str(msg.prompt, 20000) || undefined, msg.worktree === true, kind, msg.provider, model, effort, undefined, c.accountId, repos);
+          const now = resolve();
+          if (typeof now === 'string') return warn(c, now);
+          if (checkout && !floor.def.links?.some((l) => l.id === checkout)) return warn(c, NO_CHECKOUT);
+          const r = floor.workers.spawn(str(msg.deskId, 32), who, str(msg.prompt, 20000) || undefined, msg.worktree === true, kind, msg.provider, model, effort, undefined, c.accountId, now, checkout);
           const issue = kind === 'agent' ? issueNumber(msg.issue) : undefined;
-          const across = repos.length ? ` across ${[floor.def.name, ...repos.map((x) => x.name)].join(' + ')}` : '';
+          const across = now.length ? ` across ${[name, ...now.map((x) => x.name)].join(' + ')}` : link ? ` in ${link.name}` : '';
           if (typeof r === 'string') warn(c, r);
-          else toastFloor(floor, kind === 'shell' ? `${who} opened a shell at a desk` : `${who} hired ${r.name}${issue ? ` for issue #${issue}` : r.prompt ? ' with a task' : ''}${across}`);
-          if (typeof r !== 'string' && issue) takeIssue(c, floor, issue);
+          else toastFloor(floor, kind === 'shell' ? `${who} opened a shell at a desk${link ? ` in ${link.name}` : ''}` : `${who} hired ${r.name}${issue ? ` for issue #${issue}` : r.prompt ? ' with a task' : ''}${across}`);
+          if (typeof r !== 'string' && issue) takeIssue(c, floor, issue, checkout);
         };
         // Every project it gets a worktree of starts from what's on GitHub.
         const fresh = [floor, ...repos.map((x) => floors.get(x.floor)!)];
-        withSignIn(c, kind === 'agent' ? claudeFor(msg.provider ?? floor.workers.officeDefault.provider) : undefined, () => (msg.worktree === true ? withFreshBase(c, fresh, hire) : hire()));
+        const fetchIn = [checkout, ...repos.map((x) => x.checkout)];
+        withSignIn(c, kind === 'agent' ? claudeFor(msg.provider ?? floor.workers.officeDefault.provider) : undefined, () => (msg.worktree === true ? withFreshBase(c, fresh, hire, fetchIn) : hire()));
         break;
       }
       case 'worker.resume': {
@@ -1518,10 +1632,35 @@ export async function startServer(cfg: Config) {
         warn(c, w ? w.floor.workers.resume(w.wid) : 'No such worker');
         break;
       }
+      case 'worker.takeOver': {
+        const w = worker(msg.workerId);
+        if (!w) break;
+        // It carries on as the office, on the office's own Claude sign-in: admins do it.
+        if (!meOf(c.accountId).admin) return warn(c, 'Only admins can take over a session from a terminal');
+        // Still open in the terminal: only once whoever asked has confirmed they'll close it there.
+        const ext = w.info.external;
+        if (ext && pidAlive(ext.pid) && msg.force !== true) return warn(c, `${w.info.name} is still open in your terminal (PID ${ext.pid}) — confirm Take over to carry it on here anyway`);
+        const r = w.floor.workers.takeOver(w.wid);
+        if (typeof r === 'string') return warn(c, r);
+        toastFloor(w.floor, `🖥️ ${w.info.name} now runs in the office — close it in your terminal (it's PID ${r.pid})`);
+        break;
+      }
       case 'worker.kill': {
         const w = worker(msg.workerId);
         if (!w) break;
         const { floor, info } = w;
+        // Its repository is off the floor: it can't be cleaned up after until that's back (see stranded).
+        const stranded = floor.workers.stranded(info.id);
+        if (stranded) {
+          // Only forgetting it, which leaves its worktree and branch for prune: admins do that.
+          if (msg.forget !== true) return warn(c, stranded);
+          if (!meOf(c.accountId).admin) return warn(c, `${stranded} (or an admin can forget it)`);
+          const r = floor.workers.forget(info.id);
+          if (typeof r === 'string') return warn(c, r);
+          toastFloor(floor, `${who} sent ${info.name} home`);
+          toastFloor(floor, r.note, 'warn');
+          break;
+        }
         // The worker leaves right away; its worktree is dealt with after that, and the outcome follows.
         const done = floor.workers.kill(info.id, CLEANUPS.has(String(msg.cleanup)) ? msg.cleanup : undefined);
         toastFloor(floor, `${who} sent ${info.name} home`);
@@ -1562,7 +1701,7 @@ export async function startServer(cfg: Config) {
         const issue = w?.info.kind === 'agent' ? issueNumber(msg.issue) : undefined;
         if (w && !err && issue) {
           toastFloor(w.floor, `${who} handed issue #${issue} to ${w.info.name}`);
-          takeIssue(c, w.floor, issue);
+          takeIssue(c, w.floor, issue, checkoutOf(msg.checkout));
         }
         break;
       }
@@ -1600,10 +1739,12 @@ export async function startServer(cfg: Config) {
           // Put it on the board now rather than at the next poll. A refresh already in flight
           // returns at once and can miss it, so look again shortly after.
           const own = r.prs.find((p) => !p.repo || p.repo === info?.worktree?.path.split(/[\\/]/).pop());
-          void floor.github.refresh().then(() => {
-            if (own && !floor.github.pulls.items.some((p) => p.number === own.number)) setTimeout(() => void floor.github.refresh(), 3000);
+          // In the repository it works in: the floor's own, or a linked checkout's.
+          const board = floor.boardOf(info?.checkout);
+          void board?.refresh().then(() => {
+            if (own && !floor.pullsOf(info?.checkout).some((p) => p.number === own.number)) setTimeout(() => void board.refresh(), 3000);
           });
-          for (const x of info?.repos ?? []) void floors.get(x.floor)?.github.refresh();
+          for (const x of info?.repos ?? []) void floors.get(x.floor)?.boardOf(x.checkout)?.refresh();
         }));
         break;
       }
@@ -1637,24 +1778,30 @@ export async function startServer(cfg: Config) {
         if (c.attached.has(msg.workerId)) workerFloor(msg.workerId)?.workers.resize(msg.workerId, num(msg.cols), num(msg.rows));
         break;
       case 'gh.refresh':
-        void floorOf(c)?.github.refresh();
+        void floorOf(c)?.refresh();
         break;
       case 'gh.merge': {
         const floor = here();
         const n = num(msg.number);
         const method = (['squash', 'merge', 'rebase'] as const).find((m) => m === msg.method);
         if (!floor || !Number.isSafeInteger(n) || n <= 0 || !method) break;
+        const checkout = checkoutOf(msg.checkout);
+        const github = floor.boardOf(checkout);
+        if (!github) {
+          sendTo(c, { t: 'gh.merged', number: n, checkout, error: NO_CHECKOUT });
+          break;
+        }
         withGitHub(
           c,
           (as) =>
-            void floor.github.merge(n, method, msg.deleteBranch === true, msg.auto === true, as).then((error) => {
-              sendTo(c, { t: 'gh.merged', number: n, error });
+            void github.merge(n, method, msg.deleteBranch === true, msg.auto === true, as).then((error) => {
+              sendTo(c, { t: 'gh.merged', number: n, checkout, error });
               if (error) return;
               toastFloor(floor, msg.auto ? `${who} set PR #${n} to merge once its checks pass` : `🎉 ${who} merged PR #${n}`);
               // An auto-merge rings once GitHub gets round to it and the boards see it merged.
-              if (!msg.auto) floor.merged(n, who);
+              if (!msg.auto) floor.merged(n, who, checkout);
             }),
-          (error) => sendTo(c, { t: 'gh.merged', number: n, error }),
+          (error) => sendTo(c, { t: 'gh.merged', number: n, checkout, error }),
         );
         break;
       }
@@ -1663,21 +1810,23 @@ export async function startServer(cfg: Config) {
         const n = num(msg.number);
         const kind = msg.kind === 'pull' ? 'pull' : 'issue';
         if (!floor || !Number.isSafeInteger(n) || n <= 0) break;
+        const checkout = checkoutOf(msg.checkout);
+        const github = floor.boardOf(checkout);
         const body = typeof msg.body === 'string' ? msg.body : '';
         // Refused rather than cut short: a comment that silently lost its end would read as finished.
-        const invalid = !body.trim() ? 'The comment is empty' : body.length > GH_COMMENT_MAX ? `GitHub takes comments of up to ${GH_COMMENT_MAX} characters` : '';
-        if (invalid) {
-          sendTo(c, { t: 'gh.commented', kind, number: n, error: invalid });
+        const invalid = !github ? NO_CHECKOUT : !body.trim() ? 'The comment is empty' : body.length > GH_COMMENT_MAX ? `GitHub takes comments of up to ${GH_COMMENT_MAX} characters` : '';
+        if (invalid || !github) {
+          sendTo(c, { t: 'gh.commented', kind, number: n, checkout, error: invalid });
           break;
         }
         withGitHub(
           c,
           (as) =>
-            void floor.github.comment(kind, n, body, as).then((r) => {
-              sendTo(c, { t: 'gh.commented', kind, number: n, ...r });
+            void github.comment(kind, n, body, as).then((r) => {
+              sendTo(c, { t: 'gh.commented', kind, number: n, checkout, ...r });
               if (r.comment) toastFloor(floor, `💬 ${who} commented on ${kind === 'pull' ? 'PR' : 'issue'} #${n}`);
             }),
-          (error) => sendTo(c, { t: 'gh.commented', kind, number: n, error }),
+          (error) => sendTo(c, { t: 'gh.commented', kind, number: n, checkout, error }),
         );
         break;
       }
@@ -1702,18 +1851,24 @@ export async function startServer(cfg: Config) {
         const kind = msg.kind === 'issue' || msg.kind === 'pull' ? msg.kind : undefined;
         if (!floor || !Number.isSafeInteger(n) || n <= 0 || !kind) break;
         const reason = msg.reason === 'not planned' ? 'not planned' : 'completed';
+        const checkout = checkoutOf(msg.checkout);
+        const github = floor.boardOf(checkout);
+        if (!github) {
+          sendTo(c, { t: 'gh.closed', kind, number: n, checkout, error: NO_CHECKOUT });
+          break;
+        }
         withGitHub(
           c,
           (as) =>
-            void floor.github.close(kind, n, { comment: str(msg.comment, 20000).trim() || undefined, reason, deleteBranch: msg.deleteBranch === true }, as).then((error) => {
-              sendTo(c, { t: 'gh.closed', kind, number: n, error });
+            void github.close(kind, n, { comment: str(msg.comment, 20000).trim() || undefined, reason, deleteBranch: msg.deleteBranch === true }, as).then((error) => {
+              sendTo(c, { t: 'gh.closed', kind, number: n, checkout, error });
               if (error) return;
               if (kind === 'pull') return toastFloor(floor, `${who} closed PR #${n} without merging`);
-              // Nobody should be seated for an issue that's closed.
-              const dropped = floor.queue.dropIssue(n);
+              // Nobody should be seated for an issue that's closed (the queue only has the floor's own repository's).
+              const dropped = !checkout && floor.queue.dropIssue(n);
               toastFloor(floor, `${who} closed issue #${n}${reason === 'not planned' ? ' as not planned' : ''}${dropped ? ' and took it off the queue' : ''}`);
             }),
-          (error) => sendTo(c, { t: 'gh.closed', kind, number: n, error }),
+          (error) => sendTo(c, { t: 'gh.closed', kind, number: n, checkout, error }),
         );
         break;
       }
@@ -1725,18 +1880,20 @@ export async function startServer(cfg: Config) {
         const names = (v: unknown) => [...new Set((Array.isArray(v) ? v : []).map((l) => str(l, GH_LABEL_MAX + 1)).filter((l) => l && l.length <= GH_LABEL_MAX))].slice(0, 100);
         const add = names(msg.add);
         const remove = names(msg.remove).filter((l) => !add.includes(l));
-        if (!add.length && !remove.length) {
-          sendTo(c, { t: 'gh.labeled', kind, number: n, error: 'No labels to change' });
+        const checkout = checkoutOf(msg.checkout);
+        const github = floor.boardOf(checkout);
+        if (!github || (!add.length && !remove.length)) {
+          sendTo(c, { t: 'gh.labeled', kind, number: n, checkout, error: github ? 'No labels to change' : NO_CHECKOUT });
           break;
         }
         withGitHub(
           c,
           (as) =>
-            void floor.github.setLabels(kind, n, add, remove, as).then((r) => {
-              sendTo(c, { t: 'gh.labeled', kind, number: n, ...r });
+            void github.setLabels(kind, n, add, remove, as).then((r) => {
+              sendTo(c, { t: 'gh.labeled', kind, number: n, checkout, ...r });
               if (r.labels) toastFloor(floor, `🏷️ ${who} labeled ${kind === 'pull' ? 'PR' : 'issue'} #${n}: ${[...add.map((l) => `+${l}`), ...remove.map((l) => `−${l}`)].join(' ')}`);
             }),
-          (error) => sendTo(c, { t: 'gh.labeled', kind, number: n, error }),
+          (error) => sendTo(c, { t: 'gh.labeled', kind, number: n, checkout, error }),
         );
         break;
       }
@@ -1795,7 +1952,8 @@ export async function startServer(cfg: Config) {
           pr: count(msg.pr),
           issue: count(msg.issue),
           rounds: count(msg.rounds),
-          budget: count(msg.budget),
+          // 0 is a real answer here (no token limit), so it passes where count() would drop it.
+          budget: msg.budget === 0 ? 0 : count(msg.budget),
           provider: msg.provider,
           model: msg.model === undefined ? undefined : str(msg.model, OPEN_CODE_MODEL_MAX + 1),
           effort: isAgentEffort(msg.effort) ? msg.effort : undefined,
@@ -2224,6 +2382,7 @@ export async function startServer(cfg: Config) {
   const shutdown = (keep = false) => {
     clearInterval(heartbeat);
     clearInterval(resync);
+    clearInterval(terminals);
     clearTimeout(floorsTimer);
     arcade.flush();
     upgrader.stop();

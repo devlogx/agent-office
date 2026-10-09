@@ -1,4 +1,4 @@
-import { MEETING_PATTERNS, MEETING_PATTERN_IDS, TOKENS_PER_SEAT, meetingSpend, outputProblem, slugify } from '../../shared/meetings';
+import { MEETING_PATTERNS, MEETING_PATTERN_IDS, NO_MEETING_BUDGET, TOKENS_PER_SEAT, meetingBudgetLabel, meetingSpend, outputProblem, slugify } from '../../shared/meetings';
 import { fmtTokens, type Meeting, type MeetingPattern, type MeetingTurn } from '../../shared/protocol';
 import type { Net } from '../net';
 import { store } from '../state';
@@ -75,7 +75,7 @@ function renderStatus(m: Meeting, body: HTMLElement, foot: HTMLElement, net: Net
   const p = MEETING_PATTERNS[m.pattern];
   const running = m.status === 'running';
   const pill = h('span.pill', { class: running ? 'working' : m.status === 'done' ? 'done' : 'needs_input' }, running ? 'in a meeting' : m.status);
-  const f = Math.min(1, m.tokens / Math.max(1, m.budget));
+  const f = m.budget > NO_MEETING_BUDGET ? Math.min(1, m.tokens / m.budget) : 0;
   const seats = h(
     'ul.meeting-seats',
     {},
@@ -102,7 +102,7 @@ function renderStatus(m: Meeting, body: HTMLElement, foot: HTMLElement, net: Net
     ...present(
     h('div.meeting-head', {}, pill, h('b', {}, `${p.icon} ${p.label}`), h('span.meeting-title', { title: m.prompt }, m.title)),
     h('p.meeting-line', {}, running ? `${meetingStage(m)} · called by ${m.calledBy} ${timeAgo(new Date(m.startedAt).toISOString())}` : m.status === 'done' ? `✅ Wrote ${m.output} in ${m.round} round${m.round === 1 ? '' : 's'}` : `⛔ Stopped in round ${m.round}: ${m.reason ?? 'stopped'}`),
-    h('div.meeting-budget', { title: `${m.tokens.toLocaleString()} of ${m.budget.toLocaleString()} tokens` }, h('div.meeting-bar', {}, h('i', { style: `width:${(f * 100).toFixed(1)}%;background:${f > 0.9 ? 'var(--bad)' : f > 0.7 ? 'var(--warn)' : 'var(--good)'}` })), h('span', {}, `${meetingSpend(m)} of ${fmtTokens(m.budget)} tokens`)),
+    h('div.meeting-budget', { title: m.budget > NO_MEETING_BUDGET ? `${m.tokens.toLocaleString()} of ${m.budget.toLocaleString()} tokens` : `${m.tokens.toLocaleString()} tokens, no limit` }, h('div.meeting-bar', {}, h('i', { style: `width:${(f * 100).toFixed(1)}%;background:${f > 0.9 ? 'var(--bad)' : f > 0.7 ? 'var(--warn)' : 'var(--good)'}` })), h('span', {}, m.budget > NO_MEETING_BUDGET ? `${meetingSpend(m)} of ${fmtTokens(m.budget)} tokens` : `${meetingSpend(m)} · ${meetingBudgetLabel(m.budget)}`)),
     seats,
     h('div.meeting-out', {}, h('div.meeting-out-head', {}, h('b', {}, '📄 '), h('code', {}, m.output), where, review), h('pre.meeting-preview', {}, m.preview?.trim() ? m.preview : running ? 'Nothing written yet.' : 'Nothing was written.')),
     store.meeting.past.length
@@ -147,7 +147,7 @@ function meetingForm(net: Net, preset: MeetingPreset | undefined, done: () => vo
   const roleList = h('div.meeting-roles');
   const roundsIn = h('input', { type: 'number', 'aria-label': 'Rounds' }) as HTMLInputElement;
   const roundsNote = h('small.muted');
-  const budgetIn = h('input', { type: 'number', min: 50, step: 250, 'aria-label': 'Token budget in thousands' }) as HTMLInputElement;
+  const budgetIn = h('input', { type: 'number', min: 0, step: 250, 'aria-label': 'Token budget in thousands, 0 for no limit' }) as HTMLInputElement;
   const provider = providerPicker(store.project, 'meeting-provider', 'Workers');
   const busy = h('p.meeting-busy');
   const submit = h('button.btn.primary', { type: 'submit' }, '🤝 Start the meeting');
@@ -226,7 +226,7 @@ function meetingForm(net: Net, preset: MeetingPreset | undefined, done: () => vo
     partsRow,
     h('div.meeting-field', {}, h('label', {}, 'Output file'), outputIn, outputNote),
     h('div.meeting-field', {}, h('label.meeting-count', {}, 'Workers at the table', minus, count, plus), roleList),
-    h('div.meeting-bounds', {}, h('div.meeting-field', {}, h('label', {}, 'Round limit'), roundsIn, roundsNote), h('div.meeting-field', {}, h('label', {}, 'Token budget (thousands)'), budgetIn, h('small.muted', {}, 'For everyone at the table together. Over it, the meeting stops.'))),
+    h('div.meeting-bounds', {}, h('div.meeting-field', {}, h('label', {}, 'Round limit'), roundsIn, roundsNote), h('div.meeting-field', {}, h('label', {}, 'Token budget (thousands)'), budgetIn, h('small.muted', {}, 'For everyone at the table together. Over it, the meeting stops. 0 = no limit: it runs until the file is written or the rounds are up.'))),
     provider.element,
     busy,
   ) as HTMLFormElement;
@@ -256,7 +256,8 @@ function meetingForm(net: Net, preset: MeetingPreset | undefined, done: () => vo
       pr: def().needs === 'pr' ? pr() : undefined,
       issue: preset?.issue,
       rounds: Number(roundsIn.value) || undefined,
-      budget: Math.round((Number(budgetIn.value) || 0) * 1000) || undefined,
+      // 0 is sent as 0 (no limit); only an empty field leaves the default to the office.
+      budget: budgetIn.value.trim() === '' ? undefined : Math.max(0, Math.round((Number(budgetIn.value) || 0) * 1000)),
       provider: provider.value(),
       model: provider.model(),
       effort: provider.effort(),
@@ -275,7 +276,8 @@ function meetingForm(net: Net, preset: MeetingPreset | undefined, done: () => vo
 
   /** Keeps what depends on the board and the room up to date: the open PRs, and whether the room is free. */
   const refresh = () => {
-    const open = store.pulls.items.filter((p) => p.state === 'OPEN');
+    // The meeting room works in the floor's own checkout: its own repository's PRs (see GhPull.checkout).
+    const open = store.pulls.items.filter((p) => p.state === 'OPEN' && !p.checkout);
     const want = prSel.value || (preset?.pr ? String(preset.pr) : '');
     const opts: (readonly [string, string])[] = open.map((p) => [String(p.number), `#${p.number} ${p.title}`] as const);
     if (preset?.pr && !open.some((p) => p.number === preset.pr)) opts.unshift([String(preset.pr), `#${preset.pr}`]);

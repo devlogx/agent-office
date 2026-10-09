@@ -496,7 +496,20 @@ export interface Meeting {
   owner?: string;
   startedAt: number;
   finishedAt?: number;
-  /** The meeting's own git worktree, relative to the project, which everyone at the table shares. */
+  /**
+   * Which of its floor's linked checkouts it works in (FloorLink.id), on a floor with more than one
+   * repository; none for the floor's own checkout. Its worktree is cut from that repository (and still
+   * kept in the floor's .agent-office/worktrees), its workers work there, and its output is committed,
+   * or its review posted, in that repository.
+   */
+  checkout?: string;
+  /** That checkout's name ("feyer-app"), for saying where it worked once the floor no longer has it. */
+  checkoutName?: string;
+  /** Which repository that checkout is (its folder with symlinks resolved, and its origin), as for a worker's: a checkout linked again under another id is still found. */
+  checkoutAt?: { dir: string; repo?: string };
+  /** Why it can't go on right now: its checkout isn't on the floor any more (as Workers.stranded says for a worker). */
+  stranded?: string;
+  /** The meeting's own git worktree, relative to the floor's project, which everyone at the table shares. */
   worktree?: { path: string; branch: string; base: string; from?: string };
   /** Where the round notes go, relative to the checkout. */
   notes: string;
@@ -522,6 +535,8 @@ export interface MeetingRecord {
   finishedAt: number;
   branch?: string;
   output: string;
+  /** The linked checkout it worked in, by name (see Meeting.checkout); none for the floor's own. */
+  checkout?: string;
 }
 
 export interface MeetingState {
@@ -541,13 +556,20 @@ export interface MeetingRequest {
   /** A role per worker, the head of the table first. */
   roles: string[];
   parts?: string[];
+  /** Review panel: a pull request of the repository in `checkout` (numbers are only unique per repository). */
   pr?: number;
+  /** An issue of the repository in `checkout`. */
   issue?: number;
   rounds?: number;
   budget?: number;
   provider?: AgentProvider;
   model?: string;
   effort?: AgentEffort;
+  /**
+   * Which of the floor's linked checkouts it works in (FloorLink.id), on a floor with more than one
+   * repository; empty or missing for the floor's own checkout (see Meeting.checkout).
+   */
+  checkout?: string;
 }
 
 /** Where a team webhook posts: Slack and Discord get their own message format, anything else plain JSON. */

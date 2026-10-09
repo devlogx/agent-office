@@ -12,6 +12,7 @@ import { WorkerManager, relatedBlock, repoSources, withRelated, workspaceNames, 
 import type { LiveSession, ProcessProbe } from '../src/server/sessions.js';
 import { Worktrees } from '../src/server/worktrees.js';
 import type { ChangesState, GhPull, WorkerInfo } from '../src/shared/protocol.js';
+import { MEETING_SEATS } from '../src/shared/layout.js';
 
 // A worker across repositories (WorkerInfo.repos): hired on one floor with other floors' projects,
 // it works in a workspace holding a worktree of each, all on one branch, and opens a PR in each.
@@ -411,6 +412,51 @@ test('a worker hired in a linked checkout has its worktree cut from that reposit
   assert.equal(home.note, `Deleted ${w.name}'s worktree and branch ${w.worktree!.branch}`);
   assert.ok(!existsSync(wt));
   assert.equal(git(f.b, 'branch', '--list', '--format=%(refname:short)', w.worktree!.branch), '');
+});
+
+test('a meeting called in a linked checkout seats its workers there, in a worktree of that repository kept with the floor’s', async (t) => {
+  const f = fixture(t);
+  const workers = linkedManager(f, t);
+  assert.equal((workers.checkoutHome(undefined) as { dir: string }).dir, f.a);
+  assert.equal(workers.checkoutHome('web'), "web isn't on this floor any more");
+  const home = workers.checkoutHome('api');
+  assert.equal(typeof home, 'object', String(home));
+  if (typeof home === 'string') return;
+  assert.equal(home.dir, f.b);
+  assert.equal(home.link?.id, 'api');
+  assert.deepEqual(home.at, { dir: realpathSync(f.b), repo: 'acme/api' });
+  // The meeting's worktree, as the meeting room makes it: cut from api, kept in web's .agent-office.
+  const made = home.trees.create('meeting-x-0000', undefined, f.a);
+  assert.equal(typeof made, 'object', String(made));
+  if (typeof made === 'string') return;
+  const { note: _note, ...worktree } = made;
+  assert.equal(worktree.path, path.join('.agent-office', 'worktrees', 'meeting-x-0000'));
+  const wt = path.join(f.a, worktree.path);
+  assert.equal(realpathSync(path.resolve(wt, git(wt, 'rev-parse', '--git-common-dir'))), realpathSync(path.join(f.b, '.git')));
+  assert.equal(home.ref(worktree).path, path.relative(f.b, wt));
+
+  // Seated at the table in api: it runs in the meeting's worktree and says it works in api.
+  const w = workers.spawn(MEETING_SEATS[0].id, 'Ada (meeting)', 'Talk it through.', false, 'agent', undefined, undefined, undefined, { id: 'm1', worktree }, undefined, [], 'api');
+  assert.equal(typeof w, 'object', String(w));
+  if (typeof w === 'string') return;
+  assert.equal(w.checkout, 'api');
+  assert.equal(w.meeting, 'm1');
+  const [start] = await waitFor(() => f.starts(), (s) => s.length === 1);
+  assert.equal(realpathSync(start.cwd), realpathSync(wt));
+  // A board agent still works in the floor's own checkout.
+  assert.match(String(workers.spawn('station-issues', 'Ada', 'Triage.', false, 'agent', undefined, undefined, undefined, undefined, undefined, [], 'api')), /floor's own checkout/);
+  // Going home, a worker at the meeting table leaves the worktree to the meeting, which tidies it away in api's repository.
+  assert.deepEqual(await workers.kill(w.id), {});
+  assert.ok(existsSync(wt));
+  assert.equal(await home.trees.remove(home.ref(worktree), 'all'), undefined);
+  assert.ok(!existsSync(wt));
+  assert.equal(git(f.b, 'branch', '--list', '--format=%(refname:short)', worktree.branch), '');
+
+  // Linked again under another id, the same repository is found by what it is; gone, it isn't.
+  workers.setLinks([{ ...apiLink(f), id: 'api-2' }]);
+  assert.equal((workers.checkoutHome('api', home.at) as { link?: LinkedCheckout }).link?.id, 'api-2');
+  workers.setLinks([]);
+  assert.equal(workers.checkoutHome('api-2', home.at), "api-2 isn't on this floor any more");
 });
 
 test('a worker in a linked checkout without a worktree runs there, and comes back only while the floor still has it', async (t) => {

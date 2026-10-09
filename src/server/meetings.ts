@@ -793,7 +793,16 @@ export class MeetingRoom {
       if (Array.isArray(saved.past)) this.past = saved.past.filter((r) => r && typeof r.id === 'string' && typeof r.summary === 'string').slice(0, PAST_MAX);
       const m = saved.current;
       // The workers at the table outlive a restart of the office, so a meeting carries on where it was.
-      if (m && typeof m.id === 'string' && isMeetingPattern(m.pattern) && Array.isArray(m.seats) && Array.isArray(m.turns)) this.current = m;
+      if (m && typeof m.id === 'string' && isMeetingPattern(m.pattern) && Array.isArray(m.seats) && Array.isArray(m.turns)) {
+        // In a linked checkout (see Meeting.checkout): never taken for the floor's own, and only that
+        // repository's (checkoutAt). One the floor no longer has waits until it's back (see strand).
+        if (m.checkout !== undefined) m.checkout = String(m.checkout).slice(0, 40);
+        m.checkoutName = typeof m.checkoutName === 'string' ? m.checkoutName.slice(0, 100) : undefined;
+        const at = m.checkoutAt;
+        m.checkoutAt = at && typeof at.dir === 'string' && path.isAbsolute(at.dir) ? { dir: at.dir, repo: typeof at.repo === 'string' ? at.repo : undefined } : undefined;
+        this.current = m;
+        if (!m.cleared) this.strand(m);
+      }
     } catch {
       // corrupt state file: an empty room
     }

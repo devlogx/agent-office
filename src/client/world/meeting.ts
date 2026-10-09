@@ -181,6 +181,9 @@ export class MeetingSignTexture {
     const p = MEETING_PATTERNS[m.pattern];
     let y = lines(`${p.icon} ${p.label}`, `800 34px ${FONT}`, '#ffd166', 130, 1, 40);
     y = lines(m.title, `900 44px ${FONT}`, '#fffaf3', y + 16, 3, 50);
+    // On a floor with more than one repository: the one it works in.
+    if (m.checkout) y = lines(`📁 ${m.checkoutName ?? m.checkout}`, `800 30px ${FONT}`, '#bde0fe', y + 6, 1, 38);
+    if (m.stranded) y = lines(`⏸️ ${m.stranded}`, `700 28px ${FONT}`, '#ffd6e0', y + 6, 2, 34);
     y += 18;
     if (m.status === 'running') {
       y = lines(meetingStage(m), `800 32px ${FONT}`, '#e9ecef', y, 3, 40);

@@ -746,9 +746,9 @@ export function openPull(first: GhPull, net: Net, actions: BoardActions) {
       w ? h('button.btn', { type: 'button', onclick: () => actions.goToDesk(w.deskId) }, `🪑 Go to ${w.name}'s desk`) : null,
       h('button.btn', { type: 'button', title: 'Send a worker your own prompt about this PR', onclick: () => actions.ask(pullContext(it), `Ask about PR #${it.number}`, it.checkout) }, '✍️ Ask a worker…'),
       isOpen ? h('button.btn', { type: 'button', onclick: () => actions.assign(reviewPrompt(it), `Review PR #${it.number}`, it.checkout) }, '🔍 Review') : null,
-      // The meeting room works in the floor's own checkout.
-      isOpen && !it.checkout
-        ? h('button.btn', { type: 'button', title: 'A few workers review it in the meeting room, each through its own lens, and the office posts one combined review', onclick: () => actions.meeting({ pattern: 'review', pr: it.number, title: `Review of PR #${it.number}`, prompt: officePrompt('pull.panel', pullVars(it)) }) }, '🤝 Review panel…')
+      // The meeting works in the repository the PR is in.
+      isOpen
+        ? h('button.btn', { type: 'button', title: 'A few workers review it in the meeting room, each through its own lens, and the office posts one combined review', onclick: () => actions.meeting({ pattern: 'review', pr: it.number, title: `Review of PR #${it.number}`, prompt: officePrompt('pull.panel', pullVars(it)), checkout: it.checkout }) }, '🤝 Review panel…')
         : null,
       conflicts
         ? h('button.btn.primary', { type: 'button', title: 'A new worker merges the base in, resolves the conflicts, gets the checks green, then merges', onclick: handToWorker }, '✨ Fix conflicts & merge')
@@ -1195,8 +1195,8 @@ export function openIssue(first: GhIssue, net: Net, actions: BoardActions) {
       {},
       h('a.grow', { href: it.url, target: '_blank', rel: 'noopener noreferrer' }, 'Open on GitHub ↗'),
       h('button.btn', { type: 'button', title: 'Send a worker your own prompt about this issue', onclick: () => actions.ask(issueContext(it), `Ask about issue #${it.number}`, it.checkout) }, '✍️ Ask a worker…'),
-      // The meeting room, the queue and the cards on the cork board are the floor's own repository's.
-      it.checkout ? null : h('button.btn', { type: 'button', title: 'Workers take it on together in the meeting room: a debate, lead & team, map-reduce or red / blue', onclick: () => actions.meeting(issueMeeting(it.number, it.title)) }, '🤝 Meeting…'),
+      // A meeting works in the repository the issue is in (the queue and the cork board's cards are the floor's own repository's).
+      h('button.btn', { type: 'button', title: 'Workers take it on together in the meeting room: a debate, lead & team, map-reduce or red / blue', onclick: () => actions.meeting(issueMeeting(it.number, it.title, it.checkout)) }, '🤝 Meeting…'),
       closeIssue,
       queueProvider.element,
       queue,

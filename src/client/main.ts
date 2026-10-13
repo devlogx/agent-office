@@ -81,7 +81,7 @@ import { whereabouts } from './ui/whereabouts';
 import { wayTo } from './walkto';
 import { DESK_KEYS, interactionAvailable, type DeskKey } from './interaction';
 import { MeetingBoardTexture, MeetingSignTexture, meetingStage } from './world/meeting';
-import { issueMeeting, openMeeting, type MeetingPreset } from './ui/meeting';
+import { checkoutName, issueMeeting, openMeeting, type MeetingPreset } from './ui/meeting';
 import { TelescopeView } from './telescope';
 import { onModelsProgress, preloadModels } from './world/models';
 import { loadingScreen } from './ui/loading';
@@ -1626,7 +1626,7 @@ function repoChoices(): { id: string; name: string }[] {
   return [...own, ...others];
 }
 
-/** On a floor with more than one repository, the ones a new worker can be hired in: the floor's own, then each linked one (see WorkerInfo.checkout). */
+/** On a floor with more than one repository, the ones a new worker can be hired in, or a meeting called in: the floor's own, then each linked one (see WorkerInfo.checkout). */
 function checkoutChoices(): CheckoutChoice[] | undefined {
   const here = store.floors.find((f) => f.id === store.floor);
   if (!here?.links?.length) return undefined;
@@ -1951,6 +1951,7 @@ function showMeeting(preset?: MeetingPreset) {
         const w = store.workers.get(id);
         if (w) pullRequestFor(w);
       },
+      checkouts: checkoutChoices,
     },
     preset,
   );
@@ -3509,7 +3510,11 @@ const hud = mountHud(
       label: 'Meeting room',
       section: 'Open',
       status: () => store.meeting.current?.status === 'running',
-      chip: () => 'In a meeting',
+      // In a linked checkout, which one (see Meeting.checkout).
+      chip: () => {
+        const repo = store.meeting.current && checkoutName(store.meeting.current);
+        return repo ? `In a meeting · 📁 ${repo}` : 'In a meeting';
+      },
       title: () => 'Call a meeting: workers work through a question or a task together',
       run: () => showMeeting(),
     },

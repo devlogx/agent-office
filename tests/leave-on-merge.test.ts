@@ -7,6 +7,8 @@ import path from 'node:path';
 import { LeaveOnMerge, landedWorkers } from '../src/server/leave-on-merge.js';
 import { Worktrees } from '../src/server/worktrees.js';
 import type { GhPull, QueueTask, WorkerInfo, WorkerStatus } from '../src/shared/protocol.js';
+import { MEETING_SEATS } from '../src/shared/layout.js';
+import { workerPr } from '../src/shared/status.js';
 
 function worker(id: string, status: WorkerStatus = 'done', more: Partial<WorkerInfo> = {}): WorkerInfo {
   return {
@@ -103,4 +105,13 @@ test("commits in the merged PR aren't work a worktree would lose, even with the 
   git('commit', '-qm', 'c3');
   git('checkout', '-q', 'main');
   assert.equal((await trees.inspect(wt, merged)).unpushed, 1);
+});
+
+test('a meeting’s workers in a linked checkout stay at the table, and their pull request is that repository’s', () => {
+  // PR numbers are only unique within one repository: #3 is open in the floor's own and merged in api.
+  const w = worker('ada', 'done', { meeting: 'm1', deskId: MEETING_SEATS[0].id, checkout: 'api', pr: { number: 3, url: '' } });
+  const pulls = [pull(3, 'OPEN', 'office/other'), { ...pull(3, 'MERGED', 'office/ada'), checkout: 'api' }];
+  assert.deepEqual(workerPr(w, pulls, []), { state: 'merged', number: 3 });
+  // The floor looks for landed workers per repository (Floor.sendLandedHome): the meeting table isn't one of them.
+  assert.deepEqual(landedWorkers([w], pulls.filter((p) => p.checkout === 'api'), []), []);
 });

@@ -18,8 +18,11 @@ export interface MeetingWorkers {
   /** What a meeting seats when whoever calls it doesn't pick (⚙️ Settings); the default provider without it. */
   readonly officeDefault?: AgentChoice;
   list(): WorkerInfo[];
-  /** Seats an agent at a chair of the meeting table, for meeting `meeting`, in its worktree when it has one. */
-  seat(deskId: string, by: string, prompt: string, provider: AgentProvider, model: string | undefined, effort: AgentEffort | undefined, meeting: { id: string; worktree?: Meeting['worktree'] }, owner?: string): WorkerInfo | string;
+  /**
+   * Seats an agent at a chair of the meeting table, for meeting `meeting`, in its worktree when it has
+   * one, and in its checkout (a linked one's id; none for the floor's own, see WorkerInfo.checkout).
+   */
+  seat(deskId: string, by: string, prompt: string, provider: AgentProvider, model: string | undefined, effort: AgentEffort | undefined, meeting: { id: string; worktree?: Meeting['worktree']; checkout?: string }, owner?: string): WorkerInfo | string;
   prompt(id: string, text: string, by?: string): string | undefined;
   /** Keys into its terminal: Esc, to stop what it's doing. */
   write(id: string, data: string, by: string): void;
@@ -28,10 +31,35 @@ export interface MeetingWorkers {
 
 /** Git for the meeting's own worktree: made when it starts, tidied away once everyone has gone home. */
 export interface MeetingTrees {
-  /** `note` says when commits the project has were left out of it (see Worktrees.create). */
-  create(slug: string): (Required<Omit<WorktreeRef, 'made'>> & { from?: string; note?: string }) | string;
+  /**
+   * `root` is where it's kept (the floor's checkout), and the path it returns is relative to that;
+   * `note` says when commits the project has were left out of it (see Worktrees.create).
+   */
+  create(slug: string, sub: undefined, root: string): (Required<Omit<WorktreeRef, 'made'>> & { from?: string; note?: string }) | string;
+  /** Take a worktree in the checkout's own terms (see MeetingHome.ref). */
   inspect(wt: WorktreeRef): Promise<WorktreeState>;
   remove(wt: WorktreeRef, cleanup: 'worktree' | 'all'): Promise<string | undefined>;
+}
+
+/** A checkout a meeting works in: the floor's own, or one linked to it (see Meeting.checkout). */
+export interface MeetingHome {
+  /** The linked checkout's id as the floor has it now (it may have been linked again under another); none for the floor's own. */
+  checkout?: string;
+  /** Its name, for the brief, the toasts and the room's history. */
+  name: string;
+  dir: string;
+  /** Which repository a linked checkout is (see Meeting.checkoutAt). */
+  at?: { dir: string; repo?: string };
+  /** Git worktrees, when the checkout is a git repository on a branch. */
+  trees?: MeetingTrees;
+  /** A worktree whose path is relative to the floor's checkout, where it's kept, with that path relative to this checkout instead (see Workers.home). */
+  ref<T extends { path?: string }>(wt: T): T;
+}
+
+/** Where meetings work: the floor's checkouts, looked up as the floor has them now. */
+export interface MeetingCheckouts {
+  /** `checkout` names a linked checkout (FloorLink.id), none the floor's own; `at` as Meeting.checkoutAt. Why not, when the floor doesn't have it. */
+  home(checkout: string | undefined, at?: { dir: string; repo?: string }): MeetingHome | string;
 }
 
 export interface MeetingEvents {
@@ -39,8 +67,8 @@ export interface MeetingEvents {
   toast(text: string, level: 'info' | 'warn' | 'error'): void;
   /** Why nobody may be hired right now (today's budget is spent), if that's so. */
   hiringPaused(): string | undefined;
-  /** Posts the review panel's review on its pull request. Resolves to the review's URL. */
-  postReview(pr: number, file: string, owner?: string): Promise<string>;
+  /** Posts the review panel's review on its pull request, in the repository of `checkout` (see Meeting.checkout). Resolves to the review's URL. */
+  postReview(pr: number, file: string, owner?: string, checkout?: string): Promise<string>;
   /** One of the office's prompts as it has it now (rewritten in ⚙️ Settings, or the default). */
   prompt?(id: PromptId): string;
 }
@@ -82,6 +110,10 @@ interface Part {
  * Everyone at the table shares the meeting's own git worktree (in a git project). When it's done,
  * the office commits the output there, or for a review panel posts it on the pull request. The
  * workers stay at the table to be looked at until the room is cleared or the next meeting is called.
+ *
+ * On a floor with more than one repository a meeting works in the one it was called in (see
+ * Meeting.checkout): its worktree is cut from that repository, though kept with the floor's others,
+ * and its workers, its commit and its review are that repository's.
  */
 export class MeetingRoom {
   private current: Meeting | null = null;
@@ -97,12 +129,12 @@ export class MeetingRoom {
   private readySince = new Map<MeetingTurn, number>();
 
   constructor(
-    /** The project's checkout. */
+    /** The floor's checkout: meetings' worktrees are kept in its .agent-office/worktrees, whichever repository they're of. */
     private dir: string,
     private dataDir: string,
     private workers: MeetingWorkers,
-    /** Git worktrees, in a project that's a git repository. */
-    private trees: MeetingTrees | undefined,
+    /** The checkouts a meeting can work in (see MeetingCheckouts). */
+    private checkouts: MeetingCheckouts,
     private events: MeetingEvents,
   ) {
     this.statePath = path.join(dataDir, 'meetings.json');
@@ -132,6 +164,10 @@ export class MeetingRoom {
     const effort = provider === 'claude' && isAgentEffort(picked.effort) ? picked.effort : undefined;
     const bad = validateWorkerModel('agent', provider, model) ?? validateWorkerEffort('agent', provider, effort);
     if (bad) return bad;
+    // The checkout it works in: one linked to the floor, or the floor's own.
+    const home = this.checkouts.home(String(req.checkout ?? '').trim() || undefined);
+    if (typeof home === 'string') return home;
+    const trees = home.trees;
 
     const given = Array.isArray(req.roles) ? req.roles.map((r) => String(r ?? '').replace(/\s+/g, ' ').trim().slice(0, ROLE_MAX)) : [];
     const count = given.length || pattern.seats.default;
@@ -163,8 +199,8 @@ export class MeetingRoom {
     if (busy) return 'Someone is still sitting at the meeting table';
 
     let worktree: Meeting['worktree'];
-    if (this.trees) {
-      const made = this.trees.create(`meeting-${slug}-${id.slice(0, 4)}`);
+    if (trees) {
+      const made = trees.create(`meeting-${slug}-${id.slice(0, 4)}`, undefined, this.dir);
       if (typeof made === 'string') return made;
       const { note, ...ref } = made;
       worktree = ref;
@@ -195,19 +231,20 @@ export class MeetingRoom {
       calledBy: by,
       ...(owner ? { owner } : {}),
       startedAt: Date.now(),
+      ...(home.checkout ? { checkout: home.checkout, checkoutName: home.name, checkoutAt: home.at } : {}),
       worktree,
-      // Without git, the notes go with the floor's other state.
-      notes: worktree ? MEETING_NOTES_DIR : `.agent-office/meetings/${id}`,
+      // Without git, the notes go with the floor's other state (relative to the checkout it works in).
+      notes: worktree ? MEETING_NOTES_DIR : path.relative(home.dir, path.join(this.dataDir, 'meetings', id)),
     };
     mkdirSync(path.join(this.cwd(m), m.notes), { recursive: true });
     const first = this.plan(m, 1, 1) ?? [];
     for (let i = 0; i < m.seats.length; i++) {
       const part = first.find((p) => p.seat === i);
       const text = `${this.brief(m, i)}\n\n${part ? this.ask(m, part) : this.say('meeting.wait')}`;
-      const w = this.workers.seat(m.seats[i].deskId, `${by} (meeting)`, text, provider, model, effort, { id, worktree }, owner);
+      const w = this.workers.seat(m.seats[i].deskId, `${by} (meeting)`, text, provider, model, effort, { id, worktree, checkout: home.checkout }, owner);
       if (typeof w === 'string') {
         for (const s of m.seats) if (s.workerId) void this.workers.kill(s.workerId);
-        if (worktree && this.trees) void this.trees.remove(worktree, 'all');
+        if (worktree && trees) void trees.remove(home.ref(worktree), 'all');
         return w;
       }
       m.seats[i].workerId = w.id;
@@ -218,7 +255,7 @@ export class MeetingRoom {
     if (last) this.archive(last);
     this.current = m;
     this.changed();
-    this.events.toast(`🤝 ${by} called a ${pattern.label} meeting: “${title}” (${count} workers, ${rounds} round${rounds === 1 ? '' : 's'} at most, ${meetingBudgetLabel(budget)})`, 'info');
+    this.events.toast(`🤝 ${by} called a ${pattern.label} meeting: “${title}”${m.checkout ? ` in ${home.name}` : ''} (${count} workers, ${rounds} round${rounds === 1 ? '' : 's'} at most, ${meetingBudgetLabel(budget)})`, 'info');
     return undefined;
   }
 
@@ -279,7 +316,7 @@ export class MeetingRoom {
 
   private tick() {
     const m = this.current;
-    if (m?.status === 'running' && this.readPreview(m)) this.dirty = true;
+    if (m?.status === 'running' && !m.stranded && this.readPreview(m)) this.dirty = true;
     this.pump();
     if (this.dirty) this.changed();
   }
@@ -289,6 +326,8 @@ export class MeetingRoom {
     if (!m) return;
     const byId = new Map(this.workers.list().map((w) => [w.id, w]));
     if (this.tally(m, byId)) this.dirty = true;
+    // Its checkout is off the floor: nothing moves, nor is tidied away, until it's back (its workers wait too).
+    if (!m.cleared && this.strand(m)) return;
     if (m.status !== 'running') {
       // Everyone went home one by one: tidy the worktree away after them.
       if (!m.cleared && m.seats.every((s) => !s.workerId || !byId.has(s.workerId))) void this.dismiss(m);
@@ -411,7 +450,8 @@ export class MeetingRoom {
     const cwd = this.cwd(m);
     if (m.pattern === 'review' && m.pr !== undefined) {
       const pr = m.pr;
-      void this.events.postReview(pr, path.join(cwd, m.output), m.owner).then(
+      // PR numbers are only unique within one repository: the one the meeting works in.
+      void this.events.postReview(pr, path.join(cwd, m.output), m.owner, m.checkout).then(
         (url) => {
           m.review = { url };
           this.events.toast(`🔍 Posted the panel's review on PR #${pr}`, 'info');
@@ -465,7 +505,15 @@ export class MeetingRoom {
     const here = new Set(this.workers.list().map((w) => w.id));
     await Promise.all(m.seats.filter((s) => s.workerId && here.has(s.workerId)).map((s) => this.workers.kill(s.workerId!)));
     const wt = m.worktree;
-    if (!wt || !this.trees) return this.persist();
+    if (!wt) return this.persist();
+    // Its worktree is of a repository the floor doesn't have now: nothing to tidy it away with.
+    const home = this.home(m);
+    if (typeof home === 'string') {
+      this.events.toast(`Kept the “${m.title}” meeting's worktree ${path.join(this.dir, wt.path)} and branch ${wt.branch}: ${home} (or run agent-office prune there)`, 'warn');
+      return this.persist();
+    }
+    const trees = home.trees;
+    if (!trees) return this.persist();
     // Kept with the floor's state already (keepNotes): the notes, and a review panel's review, which
     // is on the pull request now, go, so they don't count as work left behind.
     const cwd = this.cwd(m);
@@ -474,11 +522,11 @@ export class MeetingRoom {
       const abs = leftover && path.resolve(cwd, leftover);
       if (abs && abs.startsWith(own)) rmSync(abs, { recursive: true, force: true });
     }
-    const state = await this.trees.inspect(wt);
+    const state = await trees.inspect(home.ref(wt));
     if (state.error || state.dirty) {
       this.events.toast(`Kept the “${m.title}” meeting's worktree and branch ${wt.branch}: ${state.error ?? `${state.dirty} uncommitted change${state.dirty === 1 ? '' : 's'}`}`, 'info');
     } else {
-      const err = await this.trees.remove(wt, state.ahead ? 'worktree' : 'all');
+      const err = await trees.remove(home.ref(wt), state.ahead ? 'worktree' : 'all');
       if (err) this.events.toast(`Couldn't tidy away the meeting's worktree: ${err}`, 'warn');
     }
     this.persist();
@@ -527,13 +575,15 @@ export class MeetingRoom {
       redblue: `Each round the Red team attacks the change (bugs, security holes, edge cases) and the Blue team fixes what holds up. The ${head} writes it all up in the last round, which comes early if Red finds nothing more.`,
       review: `Round 1: each reviewer reviews the pull request through their own lens. Round 2: the ${head} merges the reviews into one, which the office posts on the pull request.`,
     };
+    // On a floor with more than one repository: the one it works in, by name.
+    const repo = m.checkout ? (m.checkoutName ?? m.checkout) : undefined;
     const where = !m.worktree
-      ? `You're in the project's folder, which other people use too: don't commit, push or switch branches.`
+      ? `You're in ${repo ? `${repo}'s` : "the project's"} folder, which other people use too: don't commit, push or switch branches.`
       : m.pattern === 'review'
-        ? `This is a review: don't change, commit or push anything in the checkout. The only files you write are your notes${i === 0 ? ` and ${m.output}` : ''}.`
-        : `You all share one git worktree, on the branch ${m.worktree.branch}. Don't push or switch branches, and nobody commits during the rounds: ${m.pattern === 'lead' ? `at the very end of the last round the ${head} commits everything, signed, as its part says, and when the meeting is over the office commits whatever is still uncommitted` : `when the meeting is over, the office commits ${m.output}, with whatever else was changed, signed`}, there.`;
-    // The worktree sits inside the project's own folder, where a search can wander off to.
-    const inside = m.worktree ? ` The whole project is checked out in your working directory: read and write files there, by paths inside it, and never in a folder above it.` : '';
+        ? `This is a review: don't change, commit or push anything in the checkout${repo ? ` of ${repo}` : ''}. The only files you write are your notes${i === 0 ? ` and ${m.output}` : ''}.`
+        : `You all share one git worktree${repo ? ` of ${repo}` : ''}, on the branch ${m.worktree.branch}. Don't push or switch branches, and nobody commits during the rounds: ${m.pattern === 'lead' ? `at the very end of the last round the ${head} commits everything, signed, as its part says, and when the meeting is over the office commits whatever is still uncommitted` : `when the meeting is over, the office commits ${m.output}, with whatever else was changed, signed`}, there.`;
+    // The worktree sits inside the floor's own folder, where a search can wander off to.
+    const inside = m.worktree ? ` The whole ${repo ? `of ${repo}` : 'project'} is checked out in your working directory: read and write files there, by paths inside it, and never in a folder above it.` : '';
     return this.say('meeting.brief', {
       title: m.title,
       role,
@@ -643,8 +693,41 @@ export class MeetingRoom {
 
   // --- Files -----------------------------------------------------------------
 
+  /** Where everyone at the table works: the meeting's worktree (kept in the floor's checkout), or the checkout it works in. */
   private cwd(m: Meeting): string {
-    return m.worktree ? path.join(this.dir, m.worktree.path) : this.dir;
+    if (m.worktree) return path.join(this.dir, m.worktree.path);
+    const home = this.home(m);
+    return typeof home === 'string' ? this.dir : home.dir;
+  }
+
+  /**
+   * The checkout a meeting works in, as the floor has it now: linked again under another id, the
+   * meeting carries on in it there. Why not, when the floor no longer has it (see strand).
+   */
+  private home(m: Meeting): MeetingHome | string {
+    const home = this.checkouts.home(m.checkout, m.checkoutAt);
+    if (typeof home === 'string') return `the meeting works in ${m.checkoutName ?? m.checkout}, which isn't on this floor any more — add it back to carry on`;
+    if (m.checkout && home.checkout && (home.checkout !== m.checkout || home.name !== m.checkoutName)) {
+      m.checkout = home.checkout;
+      m.checkoutName = home.name;
+      this.dirty = true;
+    }
+    return home;
+  }
+
+  /**
+   * Whether a meeting is stuck because its checkout is off the floor (as Workers.stranded for a
+   * worker): it says so on the meeting until the checkout is back.
+   */
+  private strand(m: Meeting): boolean {
+    const home = m.checkout ? this.home(m) : undefined;
+    const why = typeof home === 'string' ? home : undefined;
+    if (why !== m.stranded) {
+      m.stranded = why;
+      if (why) this.events.toast(`⏸️ “${m.title}”: ${why}`, 'warn');
+      this.dirty = true;
+    }
+    return !!why;
   }
 
   /** Whether a part's file is there, with something in it, written since the part was handed over. */
@@ -714,7 +797,16 @@ export class MeetingRoom {
       if (Array.isArray(saved.past)) this.past = saved.past.filter((r) => r && typeof r.id === 'string' && typeof r.summary === 'string').slice(0, PAST_MAX);
       const m = saved.current;
       // The workers at the table outlive a restart of the office, so a meeting carries on where it was.
-      if (m && typeof m.id === 'string' && isMeetingPattern(m.pattern) && Array.isArray(m.seats) && Array.isArray(m.turns)) this.current = m;
+      if (m && typeof m.id === 'string' && isMeetingPattern(m.pattern) && Array.isArray(m.seats) && Array.isArray(m.turns)) {
+        // In a linked checkout (see Meeting.checkout): never taken for the floor's own, and only that
+        // repository's (checkoutAt). One the floor no longer has waits until it's back (see strand).
+        if (m.checkout !== undefined) m.checkout = String(m.checkout).slice(0, 40);
+        m.checkoutName = typeof m.checkoutName === 'string' ? m.checkoutName.slice(0, 100) : undefined;
+        const at = m.checkoutAt;
+        m.checkoutAt = at && typeof at.dir === 'string' && path.isAbsolute(at.dir) ? { dir: at.dir, repo: typeof at.repo === 'string' ? at.repo : undefined } : undefined;
+        this.current = m;
+        if (!m.cleared) this.strand(m);
+      }
     } catch {
       // corrupt state file: an empty room
     }

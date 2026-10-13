@@ -1,50 +1,62 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { MeetingRoom, type MeetingWorkers } from '../src/server/meetings.js';
+import { MeetingRoom, type MeetingCheckouts, type MeetingWorkers } from '../src/server/meetings.js';
 import { Worktrees } from '../src/server/worktrees.js';
 import type { AgentChoice, MeetingRequest, WorkerInfo } from '../src/shared/protocol.js';
 import { MEETING_PATTERN_IDS, isMeetingPattern, meetingSummary } from '../src/shared/meetings.js';
 import { PROMPTS, type PromptId } from '../src/shared/prompts.js';
 
 /**
- * `git`: the project is a git repository whose commits are signed with an SSH key of its own, or with
- * `signing: false`, one where signing always fails (as with a missing key or a hook refusing it).
+ * A git repository in `dir`, on main, with one commit, whose commits are signed with an SSH key of its
+ * own, or without `signing`, one where signing always fails (as with a missing key or a hook refusing it).
  */
-function fixture(opts: { git?: boolean; signing?: boolean; rewritten?: Partial<Record<PromptId, string>>; officeDefault?: AgentChoice } = {}) {
+function gitInit(dir: string, name: string, signing = true) {
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
+  git('init', '-q', '-b', 'main');
+  writeFileSync(path.join(dir, 'README.md'), `# ${name}\n`);
+  writeFileSync(path.join(dir, '.git', 'info', 'exclude'), '.agent-office/\n');
+  git('add', '.');
+  git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init');
+  git('config', 'user.email', 't@t');
+  git('config', 'user.name', 't');
+  if (!signing) {
+    git('config', 'gpg.format', 'openpgp');
+    git('config', 'gpg.program', 'false');
+  } else {
+    const key = path.join(dir, '.git', 'signing-key');
+    execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 't@t', '-f', key]);
+    writeFileSync(path.join(dir, '.git', 'allowed-signers'), `t@t ${readFileSync(`${key}.pub`, 'utf8')}`);
+    git('config', 'gpg.format', 'ssh');
+    git('config', 'gpg.ssh.program', 'ssh-keygen');
+    git('config', 'user.signingkey', key);
+    git('config', 'gpg.ssh.allowedSignersFile', path.join(dir, '.git', 'allowed-signers'));
+  }
+}
+
+/**
+ * `git`: the project is a git repository (see gitInit), signing its commits unless `signing` is false.
+ * `linked`: a second repository, api, linked to the floor as the checkout `api` (see FloorLink), which
+ * `unlink` takes off and `relink` puts back, under another id if given. Looked up as the floor does
+ * (WorkerManager.checkoutHome): by id while it's the same repository, else by which repository it is.
+ */
+function fixture(opts: { git?: boolean; signing?: boolean; linked?: boolean; rewritten?: Partial<Record<PromptId, string>>; officeDefault?: AgentChoice } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'office-meeting-'));
   const dataDir = path.join(dir, '.agent-office');
   mkdirSync(dataDir, { recursive: true });
-  if (opts.git) {
-    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
-    git('init', '-q', '-b', 'main');
-    writeFileSync(path.join(dir, 'README.md'), '# demo\n');
-    writeFileSync(path.join(dir, '.git', 'info', 'exclude'), '.agent-office/\n');
-    git('add', '.');
-    git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init');
-    git('config', 'user.email', 't@t');
-    git('config', 'user.name', 't');
-    if (opts.signing === false) {
-      git('config', 'gpg.format', 'openpgp');
-      git('config', 'gpg.program', 'false');
-    } else {
-      const key = path.join(dir, '.git', 'signing-key');
-      execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 't@t', '-f', key]);
-      writeFileSync(path.join(dir, '.git', 'allowed-signers'), `t@t ${readFileSync(`${key}.pub`, 'utf8')}`);
-      git('config', 'gpg.format', 'ssh');
-      git('config', 'gpg.ssh.program', 'ssh-keygen');
-      git('config', 'user.signingkey', key);
-      git('config', 'gpg.ssh.allowedSignersFile', path.join(dir, '.git', 'allowed-signers'));
-    }
-  }
+  if (opts.git) gitInit(dir, 'demo', opts.signing !== false);
+  const apiDir = opts.linked ? mkdtempSync(path.join(tmpdir(), 'office-meeting-api-')) : '';
+  if (apiDir) gitInit(apiDir, 'api');
+  const apiTrees = apiDir ? new Worktrees(apiDir) : undefined;
+  let link: string | undefined = apiDir ? 'api' : undefined;
   const workers: WorkerInfo[] = [];
   const prompts: { id: string; text: string }[] = [];
   const typed: { id: string; data: string }[] = [];
   const toasts: string[] = [];
-  const reviews: { pr: number; file: string }[] = [];
+  const reviews: { pr: number; file: string; checkout?: string }[] = [];
   let ids = 0;
   const manager: MeetingWorkers = {
     defaultProvider: 'claude',
@@ -55,7 +67,7 @@ function fixture(opts: { git?: boolean; signing?: boolean; rewritten?: Partial<R
       const worker: WorkerInfo = {
         id: `w${++ids}`, deskId, kind: 'agent', provider, model, effort, prompt, name: `Worker ${workers.length + 1}`,
         color: '#fff', status: 'starting', acked: true, createdBy: by, createdAt: Date.now(), cols: 80, rows: 24, viewers: [],
-        worktree: meeting.worktree, meeting: meeting.id,
+        worktree: meeting.worktree, meeting: meeting.id, checkout: meeting.checkout,
       };
       workers.push(worker);
       prompts.push({ id: worker.id, text: prompt });
@@ -75,16 +87,28 @@ function fixture(opts: { git?: boolean; signing?: boolean; rewritten?: Partial<R
       return {};
     },
   };
-  const room: MeetingRoom = new MeetingRoom(dir, dataDir, manager, opts.git ? new Worktrees(dir) : undefined, {
-    update() {},
-    toast: (text) => toasts.push(text),
-    hiringPaused: () => undefined,
-    postReview: async (pr, file) => {
-      reviews.push({ pr, file });
-      return `https://github.com/o/r/pull/${pr}#pullrequestreview-1`;
+  const trees = opts.git ? new Worktrees(dir) : undefined;
+  const checkouts: MeetingCheckouts = {
+    home(checkout, at) {
+      if (!checkout) return { name: 'demo', dir, trees, ref: (wt) => wt };
+      const api = { dir: realpathSync(apiDir || dir) };
+      const found = link && apiDir && (checkout === link || at?.dir === api.dir);
+      if (!found) return `${checkout} isn't on this floor any more`;
+      return { checkout: link, name: 'api', dir: apiDir, at: api, trees: apiTrees, ref: (wt) => (wt.path ? { ...wt, path: path.relative(apiDir, path.join(dir, wt.path)) } : wt) };
     },
-    prompt: (id) => opts.rewritten?.[id] ?? PROMPTS[id].text,
-  });
+  };
+  const open = () =>
+    new MeetingRoom(dir, dataDir, manager, checkouts, {
+      update() {},
+      toast: (text) => toasts.push(text),
+      hiringPaused: () => undefined,
+      postReview: async (pr, file, _owner, checkout) => {
+        reviews.push({ pr, file, ...(checkout ? { checkout } : {}) });
+        return `https://github.com/o/r/pull/${pr}#pullrequestreview-1`;
+      },
+      prompt: (id) => opts.rewritten?.[id] ?? PROMPTS[id].text,
+    });
+  let room: MeetingRoom = open();
   const cwd = () => {
     const wt = room.state().current?.worktree;
     return wt ? path.join(dir, wt.path) : dir;
@@ -114,7 +138,19 @@ function fixture(opts: { git?: boolean; signing?: boolean; rewritten?: Partial<R
     }
   };
   const start = (req: Partial<MeetingRequest>) => room.start({ pattern: 'debate', prompt: 'Which cache should we use?', roles: [], ...req } as MeetingRequest, 'Ada');
-  return { dir, room, workers, prompts, typed, toasts, reviews, take, settle, start, cwd, kill: (id: string) => manager.kill(id), close() { room.shutdown(); rmSync(dir, { recursive: true, force: true }); } };
+  return {
+    dir, apiDir, workers, prompts, typed, toasts, reviews, take, settle, start, cwd, kill: (id: string) => manager.kill(id),
+    get room() { return room; },
+    unlink() { link = undefined; },
+    relink(id = 'api') { link = id; },
+    /** The office restarts: a new meeting room reads meetings.json. */
+    reopen() { room.shutdown(); room = open(); },
+    close() {
+      room.shutdown();
+      rmSync(dir, { recursive: true, force: true });
+      if (apiDir) rmSync(apiDir, { recursive: true, force: true });
+    },
+  };
 }
 
 test('a debate runs its rounds and ends when the chair writes the decision', (t) => {
@@ -361,4 +397,120 @@ test('a meeting says what the office’s rewritten prompts say, and seats the de
   t.after(() => g.close());
   assert.equal(g.start({ provider: 'claude', model: 'haiku' }), undefined);
   assert.deepEqual(g.workers.map((x) => x.model), ['haiku', 'haiku', 'haiku']);
+});
+
+// A floor with more than one repository (see FloorLink): api's checkout is linked to the floor, and a
+// meeting called in it works there.
+
+const until = async (ok: () => unknown) => {
+  for (let i = 0; i < 100 && !ok(); i++) await new Promise((r) => setTimeout(r, 20));
+};
+
+test('a meeting in a linked checkout has its worktree cut from that repository, kept with the floor’s, and commits there', async (t) => {
+  const f = fixture({ git: true, linked: true }); t.after(() => f.close());
+  const gitIn = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+  assert.equal(f.start({ rounds: 2, output: 'docs/contract.md', title: 'API contract', checkout: 'api' }), undefined);
+  const m0 = f.room.state().current!;
+  assert.equal(m0.checkout, 'api');
+  assert.equal(m0.checkoutName, 'api');
+  // In the floor's .agent-office/worktrees, by a path relative to the floor; a worktree of api's repository.
+  assert.match(m0.worktree!.path, /^\.agent-office\/worktrees\/meeting-api-contract-/);
+  const wt = path.join(f.dir, m0.worktree!.path);
+  assert.equal(realpathSync(path.resolve(wt, gitIn(wt, 'rev-parse', '--git-common-dir'))), realpathSync(path.join(f.apiDir, '.git')));
+  assert.equal(gitIn(f.apiDir, 'branch', '--list', '--format=%(refname:short)', m0.worktree!.branch), m0.worktree!.branch);
+  assert.equal(gitIn(f.dir, 'branch', '--list', '--format=%(refname:short)', m0.worktree!.branch), '');
+  assert.ok(!existsSync(path.join(f.apiDir, '.agent-office')), 'nothing is written into the linked checkout');
+  // Everyone at the table works in api, and is told so.
+  assert.deepEqual(f.workers.map((w) => w.checkout), ['api', 'api', 'api']);
+  assert.match(f.prompts[0].text, /one git worktree of api, on the branch office\/meeting-api-contract-/);
+  assert.match(f.prompts[0].text, /The whole of api is checked out in your working directory/);
+  assert.ok(f.prompts[0].text.includes(path.join(wt, '.meeting', 'r1-1-chair.md')));
+
+  for (const i of [0, 1, 2]) f.take(i);
+  f.take(0, '# The contract\n');
+  await until(() => f.room.state().current!.commit);
+  const m = f.room.state().current!;
+  assert.equal(m.status, 'done');
+  assert.ok(m.commit);
+  // The output is committed in api's repository, on the meeting's branch.
+  assert.equal(gitIn(f.apiDir, 'show', `${m.worktree!.branch}:docs/contract.md`), '# The contract');
+  assert.equal(gitIn(f.apiDir, 'show', '--name-only', '--format=', m.worktree!.branch), 'docs/contract.md');
+  assert.match(f.toasts.find((x) => x.startsWith('🤝 Ada called'))!, /“API contract” in api \(/);
+
+  // Cleared, the worktree goes (looked at in api's repository) and the branch with the commit stays.
+  assert.equal(f.room.clear('Ada'), undefined);
+  await until(() => !existsSync(wt));
+  assert.ok(!existsSync(wt));
+  assert.equal(gitIn(f.apiDir, 'rev-parse', '--abbrev-ref', m.worktree!.branch), m.worktree!.branch);
+  const past = f.room.state().past[0];
+  assert.equal(past.checkout, 'api');
+  assert.match(past.summary, /✅ docs\/contract\.md on office\/meeting-api-contract-\w+ in api$/);
+});
+
+test('a review panel in a linked checkout posts on that repository’s pull request', async (t) => {
+  const f = fixture({ git: true, linked: true }); t.after(() => f.close());
+  assert.equal(f.start({ pattern: 'review', prompt: 'Review it', pr: 7, checkout: 'api' }), undefined);
+  for (const i of [0, 1, 2]) f.take(i, '- a.ts:1 — something');
+  f.take(0, 'Looks fine.');
+  await until(() => f.reviews.length);
+  assert.deepEqual(f.reviews, [{ pr: 7, file: path.join(f.cwd(), 'reviews/pr-7.md'), checkout: 'api' }]);
+  assert.match(f.prompts[0].text, /don't change, commit or push anything in the checkout of api/);
+});
+
+test('a meeting can’t be called in a checkout the floor doesn’t have', (t) => {
+  const f = fixture({ git: true, linked: true }); t.after(() => f.close());
+  assert.match(f.start({ checkout: 'web' }) ?? '', /^web isn't on this floor any more$/);
+  f.unlink();
+  assert.match(f.start({ checkout: 'api' }) ?? '', /^api isn't on this floor any more$/);
+  assert.equal(f.workers.length, 0);
+  assert.equal(f.room.state().current, null);
+  // The floor's own checkout is always there.
+  assert.equal(f.start({}), undefined);
+  assert.equal(f.room.state().current!.checkout, undefined);
+});
+
+test('a meeting whose checkout goes off the floor waits, saying so, and carries on once it’s back', (t) => {
+  const f = fixture({ git: true, linked: true }); t.after(() => f.close());
+  assert.equal(f.start({ rounds: 2, checkout: 'api' }), undefined);
+  f.unlink();
+  for (const i of [0, 1, 2]) f.take(i);
+  let m = f.room.state().current!;
+  assert.match(m.stranded ?? '', /the meeting works in api, which isn't on this floor any more — add it back to carry on/);
+  assert.equal(m.status, 'running');
+  assert.equal(m.round, 1, 'nothing moves on while it waits');
+  assert.ok(f.toasts.some((x) => x.startsWith('⏸️')));
+  f.relink();
+  f.room.pump();
+  m = f.room.state().current!;
+  assert.equal(m.stranded, undefined);
+  assert.equal(m.round, 2, 'the parts written meanwhile count');
+});
+
+test('a meeting in a linked checkout comes back after a restart only while the floor has that repository, under any id', async (t) => {
+  const f = fixture({ git: true, linked: true }); t.after(() => f.close());
+  assert.equal(f.start({ rounds: 2, checkout: 'api' }), undefined);
+  const saved = JSON.parse(readFileSync(path.join(f.dir, '.agent-office', 'meetings.json'), 'utf8'));
+  assert.equal(saved.current.checkout, 'api');
+  assert.equal(saved.current.checkoutAt.dir, realpathSync(f.apiDir));
+  // Restarted without it: the meeting waits, and is never taken to be in the floor's own checkout.
+  f.unlink();
+  f.reopen();
+  let m = f.room.state().current!;
+  assert.equal(m.checkout, 'api');
+  assert.match(m.stranded ?? '', /api, which isn't on this floor any more/);
+  // Linked again under another id: it's the same repository, so the meeting carries on in it there.
+  f.relink('api-2');
+  f.reopen();
+  m = f.room.state().current!;
+  assert.equal(m.checkout, 'api-2');
+  assert.equal(m.stranded, undefined);
+  // Cleared while its checkout is off the floor: the worktree stays where it is, and the room says so.
+  f.room.stop('Ada');
+  f.unlink();
+  f.room.pump();
+  const wt = path.join(f.dir, m.worktree!.path);
+  assert.equal(f.room.clear('Ada'), undefined);
+  await until(() => f.toasts.some((x) => x.startsWith('Kept the')));
+  assert.ok(existsSync(wt));
+  assert.match(f.toasts.find((x) => x.startsWith('Kept the'))!, /works in api, which isn't on this floor any more .*agent-office prune/);
 });

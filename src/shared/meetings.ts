@@ -149,10 +149,11 @@ export function meetingSummary(m: Meeting): string {
   const head = `${p.icon} ${p.label} · ${ran} · ${meetingSpend(m)}`;
   if (m.status === 'stopped') return `${head} · ⛔ ${m.reason ?? 'stopped'}`;
   if (m.status === 'running') return head;
+  const repo = m.checkout ? ` in ${m.checkoutName ?? m.checkout}` : '';
   const where = m.review?.url ? ' · posted on the PR' : m.review?.error ? ` · couldn't post it: ${m.review.error}` : m.commitError ? ` · couldn't commit it: ${m.commitError}` : m.commit ? ` on ${m.worktree?.branch}` : m.worktree ? ` in ${m.worktree.branch}'s worktree` : '';
-  return `${head} · ✅ ${m.output}${where}`;
+  return `${head} · ✅ ${m.output}${where}${repo}`;
 }
 
 export function meetingRecord(m: Meeting): MeetingRecord {
-  return { id: m.id, pattern: m.pattern, title: m.title, status: m.status, summary: meetingSummary(m), calledBy: m.calledBy, finishedAt: m.finishedAt ?? Date.now(), branch: m.worktree?.branch, output: m.output };
+  return { id: m.id, pattern: m.pattern, title: m.title, status: m.status, summary: meetingSummary(m), calledBy: m.calledBy, finishedAt: m.finishedAt ?? Date.now(), branch: m.worktree?.branch, output: m.output, checkout: m.checkout ? (m.checkoutName ?? m.checkout) : undefined };
 }

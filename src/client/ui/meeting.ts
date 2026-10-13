@@ -4,7 +4,7 @@ import type { Net } from '../net';
 import { store } from '../state';
 import { meetingStage } from '../world/meeting';
 import { h, openModal, timeAgo, toast, STATUS_LABEL, type Modal } from './dom';
-import { confirmDialog } from './prompt';
+import { checkoutPicker, confirmDialog, type CheckoutChoice } from './prompt';
 import { providerPicker } from './provider';
 import { officePrompt } from './prompts';
 import { issueVars } from './boards';
@@ -16,17 +16,44 @@ export interface MeetingPreset {
   title?: string;
   pr?: number;
   issue?: number;
+  /** The linked checkout `pr` or `issue` is in (see GhIssue.checkout); the meeting works there. */
+  checkout?: string;
 }
 
 export interface MeetingActions {
   openTerminal(workerId: string): void;
   /** Push the meeting's branch and open a pull request for it, through the head of the table's worker. */
   openPr(workerId: string): void;
+  /** On a floor with more than one repository: the checkouts a meeting can work in (see checkoutPicker). */
+  checkouts(): CheckoutChoice[] | undefined;
 }
 
-/** A meeting about a GitHub issue: the form filled in with it. */
-export function issueMeeting(n: number, title: string): MeetingPreset {
-  return { issue: n, title: `#${n} ${title}`, prompt: officePrompt('issue.meeting', issueVars({ number: n, title })) };
+/** A meeting about a GitHub issue, in the repository it's in (`checkout`, see GhIssue.checkout): the form filled in with it. */
+export function issueMeeting(n: number, title: string, checkout?: string): MeetingPreset {
+  return { issue: n, title: `#${n} ${title}`, prompt: officePrompt('issue.meeting', issueVars({ number: n, title })), checkout };
+}
+
+/** A linked checkout's name as the floor has it, or as the meeting remembers it (see Meeting.checkout). */
+export function checkoutName(m: Pick<Meeting, 'checkout' | 'checkoutName'>): string | undefined {
+  if (!m.checkout) return undefined;
+  return store.currentFloor()?.links?.find((l) => l.id === m.checkout)?.name ?? m.checkoutName ?? m.checkout;
+}
+
+const CHECKOUT_KEY = 'agent-office.meeting-checkout';
+/** The checkout the last meeting on this floor was called in, to start the next form with. */
+function lastCheckout(): string {
+  try {
+    return localStorage.getItem(`${CHECKOUT_KEY}.${store.floor}`) ?? '';
+  } catch {
+    return '';
+  }
+}
+function rememberCheckout(id: string) {
+  try {
+    localStorage.setItem(`${CHECKOUT_KEY}.${store.floor}`, id);
+  } catch {
+    // just a convenience
+  }
 }
 
 const PART_LABEL: Record<MeetingTurn['state'], string> = { waiting: '⏳ up next', sent: '📨 handed over', working: '💬 on it', done: '✅ written' };
@@ -55,7 +82,7 @@ export function openMeeting(net: Net, actions: MeetingActions, preset?: MeetingP
       return;
     }
     if (!form) {
-      form = meetingForm(net, preset, () => modal.close(), () => {
+      form = meetingForm(net, preset, actions.checkouts(), () => modal.close(), () => {
         view = 'status';
         render();
       });
@@ -96,17 +123,19 @@ function renderStatus(m: Meeting, body: HTMLElement, foot: HTMLElement, net: Net
       );
     }),
   );
+  const repo = checkoutName(m);
   const where = m.worktree ? h('span', {}, '🌿 ', h('code', {}, m.worktree.branch), m.commit ? ` · committed ${m.commit}` : '', m.commitError ? h('span.bad', {}, ` · couldn't commit: ${m.commitError}`) : '') : null;
   const review = m.review?.url ? h('a', { href: m.review.url, target: '_blank', rel: 'noopener noreferrer' }, `🔍 The review on PR #${m.pr} ↗`) : m.review?.error ? h('span.bad', {}, `Couldn't post the review: ${m.review.error}`) : null;
   body.replaceChildren(
     ...present(
-    h('div.meeting-head', {}, pill, h('b', {}, `${p.icon} ${p.label}`), h('span.meeting-title', { title: m.prompt }, m.title)),
+    h('div.meeting-head', {}, pill, h('b', {}, `${p.icon} ${p.label}`), h('span.meeting-title', { title: m.prompt }, m.title), repo ? h('span.muted', { title: 'The repository it works in' }, `📁 ${repo}`) : null),
+    m.stranded ? h('p.bad', {}, `⏸️ ${m.stranded}`) : null,
     h('p.meeting-line', {}, running ? `${meetingStage(m)} · called by ${m.calledBy} ${timeAgo(new Date(m.startedAt).toISOString())}` : m.status === 'done' ? `✅ Wrote ${m.output} in ${m.round} round${m.round === 1 ? '' : 's'}` : `⛔ Stopped in round ${m.round}: ${m.reason ?? 'stopped'}`),
     h('div.meeting-budget', { title: m.budget > NO_MEETING_BUDGET ? `${m.tokens.toLocaleString()} of ${m.budget.toLocaleString()} tokens` : `${m.tokens.toLocaleString()} tokens, no limit` }, h('div.meeting-bar', {}, h('i', { style: `width:${(f * 100).toFixed(1)}%;background:${f > 0.9 ? 'var(--bad)' : f > 0.7 ? 'var(--warn)' : 'var(--good)'}` })), h('span', {}, m.budget > NO_MEETING_BUDGET ? `${meetingSpend(m)} of ${fmtTokens(m.budget)} tokens` : `${meetingSpend(m)} · ${meetingBudgetLabel(m.budget)}`)),
     seats,
     h('div.meeting-out', {}, h('div.meeting-out-head', {}, h('b', {}, '📄 '), h('code', {}, m.output), where, review), h('pre.meeting-preview', {}, m.preview?.trim() ? m.preview : running ? 'Nothing written yet.' : 'Nothing was written.')),
     store.meeting.past.length
-      ? h('details.meeting-past', {}, h('summary', {}, `Earlier meetings (${store.meeting.past.length})`), h('ul', {}, ...store.meeting.past.map((r) => h('li', { title: `Called by ${r.calledBy}` }, h('b', {}, r.title), h('div.muted', {}, r.summary)))))
+      ? h('details.meeting-past', {}, h('summary', {}, `Earlier meetings (${store.meeting.past.length})`), h('ul', {}, ...store.meeting.past.map((r) => h('li', { title: `Called by ${r.calledBy}` }, h('b', {}, r.title), r.checkout ? h('span.muted', {}, ` · 📁 ${r.checkout}`) : null, h('div.muted', {}, r.summary)))))
       : null,
     ),
   );
@@ -125,7 +154,7 @@ function renderStatus(m: Meeting, body: HTMLElement, foot: HTMLElement, net: Net
 const present = (...xs: (Node | null)[]): Node[] => xs.filter((x): x is Node => x !== null);
 
 /** The form that calls a meeting: the pattern, what it's about, who sits down, the output, the bounds. */
-function meetingForm(net: Net, preset: MeetingPreset | undefined, done: () => void, back: () => void) {
+function meetingForm(net: Net, preset: MeetingPreset | undefined, checkouts: CheckoutChoice[] | undefined, done: () => void, back: () => void) {
   let pattern: MeetingPattern = preset?.pattern ?? 'debate';
   let roles: string[] = [];
   let outputTouched = false;
@@ -149,6 +178,15 @@ function meetingForm(net: Net, preset: MeetingPreset | undefined, done: () => vo
   const roundsNote = h('small.muted');
   const budgetIn = h('input', { type: 'number', min: 0, step: 250, 'aria-label': 'Token budget in thousands, 0 for no limit' }) as HTMLInputElement;
   const provider = providerPicker(store.project, 'meeting-provider', 'Workers');
+  // On a floor with more than one repository: which one it works in, as from the issue or PR it's
+  // about, else the one picked last time. Its worktree, workers, commit and PRs are that one's.
+  const multi = (checkouts?.length ?? 0) > 1;
+  const initial = !multi ? '' : preset && (preset.pr || preset.issue) ? (preset.checkout ?? '') : (preset?.checkout ?? lastCheckout());
+  const checkout = checkoutPicker(checkouts, { element: null, value: () => [], exclude() {} }, initial);
+  const branchHere = () => {
+    const c = checkout.value();
+    return c ? store.currentFloor()?.links?.find((l) => l.id === c)?.branch : store.project?.branch;
+  };
   const busy = h('p.meeting-busy');
   const submit = h('button.btn.primary', { type: 'submit' }, '🤝 Start the meeting');
   const cancel = h('button.btn', { type: 'button', onclick: store.meeting.current ? back : done }, store.meeting.current ? '← Back' : 'Cancel');
@@ -159,7 +197,7 @@ function meetingForm(net: Net, preset: MeetingPreset | undefined, done: () => vo
   const syncOutput = () => {
     if (!outputTouched) outputIn.value = def().output(slug(), pr());
     const problem = outputProblem(outputIn.value.trim());
-    outputNote.textContent = problem ? `⚠️ ${problem}` : pattern === 'review' ? 'It ends when this file is written; the office then posts it on the PR as one review.' : store.project?.branch ? 'It ends when this file is written; the office commits it on the meeting’s own branch.' : 'It ends when this file is written.';
+    outputNote.textContent = problem ? `⚠️ ${problem}` : pattern === 'review' ? 'It ends when this file is written; the office then posts it on the PR as one review.' : branchHere() ? 'It ends when this file is written; the office commits it on the meeting’s own branch.' : 'It ends when this file is written.';
     outputNote.classList.toggle('bad', !!problem);
   };
   const syncBudget = () => {
@@ -215,11 +253,18 @@ function meetingForm(net: Net, preset: MeetingPreset | undefined, done: () => vo
   titleIn.addEventListener('input', syncOutput);
   about.addEventListener('input', syncOutput);
   prSel.addEventListener('change', syncOutput);
+  // Another repository: its own pull requests (numbers are only unique within one).
+  checkout.element?.addEventListener('change', () => {
+    prSel.value = '';
+    refresh();
+    syncOutput();
+  });
 
   const bodyEl = h(
     'form.meeting-form',
     {},
     patterns,
+    checkout.element ? h('div.meeting-field', {}, checkout.element) : null,
     h('div.meeting-field', {}, h('label', {}, 'What’s it about?'), about),
     h('div.meeting-field', {}, titleIn),
     prRow,
@@ -261,7 +306,9 @@ function meetingForm(net: Net, preset: MeetingPreset | undefined, done: () => vo
       provider: provider.value(),
       model: provider.model(),
       effort: provider.effort(),
+      checkout: checkout.value(),
     });
+    if (multi) rememberCheckout(checkout.value() ?? '');
     toast(`🤝 Calling the ${def().label} meeting: the workers are heading for the meeting room`);
     done();
   };
@@ -276,15 +323,18 @@ function meetingForm(net: Net, preset: MeetingPreset | undefined, done: () => vo
 
   /** Keeps what depends on the board and the room up to date: the open PRs, and whether the room is free. */
   const refresh = () => {
-    // The meeting room works in the floor's own checkout: its own repository's PRs (see GhPull.checkout).
-    const open = store.pulls.items.filter((p) => p.state === 'OPEN' && !p.checkout);
-    const want = prSel.value || (preset?.pr ? String(preset.pr) : '');
+    // The pull requests of the repository the meeting works in (see GhPull.checkout).
+    const c = checkout.value();
+    const open = store.pulls.items.filter((p) => p.state === 'OPEN' && p.checkout === c);
+    // The preset's PR is in the repository it came from.
+    const presetPr = preset?.pr && (preset.checkout || undefined) === c ? preset.pr : undefined;
+    const want = prSel.value || (presetPr ? String(presetPr) : '');
     const opts: (readonly [string, string])[] = open.map((p) => [String(p.number), `#${p.number} ${p.title}`] as const);
-    if (preset?.pr && !open.some((p) => p.number === preset.pr)) opts.unshift([String(preset.pr), `#${preset.pr}`]);
+    if (presetPr && !open.some((p) => p.number === presetPr)) opts.unshift([String(presetPr), `#${presetPr}`]);
     const key = JSON.stringify(opts);
     if (prSel.dataset.key !== key) {
       prSel.dataset.key = key;
-      prSel.replaceChildren(h('option', { value: '' }, open.length || preset?.pr ? 'Pick a pull request…' : 'No open pull requests'), ...opts.map(([v, label]) => h('option', { value: v }, label.length > 70 ? `${label.slice(0, 69)}…` : label)));
+      prSel.replaceChildren(h('option', { value: '' }, open.length || presetPr ? 'Pick a pull request…' : 'No open pull requests'), ...opts.map(([v, label]) => h('option', { value: v }, label.length > 70 ? `${label.slice(0, 69)}…` : label)));
       prSel.value = want;
       syncOutput();
     }

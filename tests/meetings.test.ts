@@ -7,11 +7,14 @@ import path from 'node:path';
 import { MeetingRoom, type MeetingCheckouts, type MeetingWorkers } from '../src/server/meetings.js';
 import { Worktrees } from '../src/server/worktrees.js';
 import type { AgentChoice, MeetingRequest, WorkerInfo } from '../src/shared/protocol.js';
-import { MEETING_PATTERN_IDS, isMeetingPattern } from '../src/shared/meetings.js';
+import { MEETING_PATTERN_IDS, isMeetingPattern, meetingSummary } from '../src/shared/meetings.js';
 import { PROMPTS, type PromptId } from '../src/shared/prompts.js';
 
-/** A git repository in `dir`, on main, with one commit. */
-function gitInit(dir: string, name: string) {
+/**
+ * A git repository in `dir`, on main, with one commit, whose commits are signed with an SSH key of its
+ * own, or without `signing`, one where signing always fails (as with a missing key or a hook refusing it).
+ */
+function gitInit(dir: string, name: string, signing = true) {
   const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
   git('init', '-q', '-b', 'main');
   writeFileSync(path.join(dir, 'README.md'), `# ${name}\n`);
@@ -20,18 +23,31 @@ function gitInit(dir: string, name: string) {
   git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init');
   git('config', 'user.email', 't@t');
   git('config', 'user.name', 't');
+  if (!signing) {
+    git('config', 'gpg.format', 'openpgp');
+    git('config', 'gpg.program', 'false');
+  } else {
+    const key = path.join(dir, '.git', 'signing-key');
+    execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 't@t', '-f', key]);
+    writeFileSync(path.join(dir, '.git', 'allowed-signers'), `t@t ${readFileSync(`${key}.pub`, 'utf8')}`);
+    git('config', 'gpg.format', 'ssh');
+    git('config', 'gpg.ssh.program', 'ssh-keygen');
+    git('config', 'user.signingkey', key);
+    git('config', 'gpg.ssh.allowedSignersFile', path.join(dir, '.git', 'allowed-signers'));
+  }
 }
 
 /**
+ * `git`: the project is a git repository (see gitInit), signing its commits unless `signing` is false.
  * `linked`: a second repository, api, linked to the floor as the checkout `api` (see FloorLink), which
  * `unlink` takes off and `relink` puts back, under another id if given. Looked up as the floor does
  * (WorkerManager.checkoutHome): by id while it's the same repository, else by which repository it is.
  */
-function fixture(opts: { git?: boolean; linked?: boolean; rewritten?: Partial<Record<PromptId, string>>; officeDefault?: AgentChoice } = {}) {
+function fixture(opts: { git?: boolean; signing?: boolean; linked?: boolean; rewritten?: Partial<Record<PromptId, string>>; officeDefault?: AgentChoice } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'office-meeting-'));
   const dataDir = path.join(dir, '.agent-office');
   mkdirSync(dataDir, { recursive: true });
-  if (opts.git) gitInit(dir, 'demo');
+  if (opts.git) gitInit(dir, 'demo', opts.signing !== false);
   const apiDir = opts.linked ? mkdtempSync(path.join(tmpdir(), 'office-meeting-api-')) : '';
   if (apiDir) gitInit(apiDir, 'api');
   const apiTrees = apiDir ? new Worktrees(apiDir) : undefined;
@@ -291,11 +307,12 @@ test('in a git project the output is committed on the meeting branch, which outl
   for (let i = 0; i < 50 && !f.room.state().current!.commit; i++) await new Promise((r) => setTimeout(r, 20));
   const m = f.room.state().current!;
   assert.equal(m.status, 'done');
-  assert.ok(m.commit);
+  assert.ok(m.commit, m.commitError);
   const git = (...args: string[]) => execFileSync('git', args, { cwd: f.dir, encoding: 'utf8' }).trim();
   assert.equal(git('show', `${m.worktree!.branch}:docs/decision.md`), '# Redis');
-  // Notes stay out of the commit.
+  // Notes stay out of the commit, which is signed.
   assert.equal(git('show', '--name-only', '--format=', m.worktree!.branch), 'docs/decision.md');
+  git('verify-commit', m.worktree!.branch);
   assert.equal(f.room.clear('Ada'), undefined);
   for (let i = 0; i < 50 && existsSync(path.join(f.dir, m.worktree!.path)); i++) await new Promise((r) => setTimeout(r, 20));
   assert.equal(f.workers.length, 0);
@@ -303,6 +320,51 @@ test('in a git project the output is committed on the meeting branch, which outl
   assert.equal(git('rev-parse', '--abbrev-ref', m.worktree!.branch), m.worktree!.branch);
   assert.equal(f.room.state().current, null);
   assert.match(f.room.state().past[0].summary, /Debate · 2 rounds · 0 tokens · \$0\.00 · ✅ docs\/decision\.md on office\/meeting-pick-a-cache-/);
+});
+
+test('in Lead & team nobody commits during the rounds, and the lead commits everything signed at the end, which the office reports', async (t) => {
+  const f = fixture({ git: true }); t.after(() => f.close());
+  assert.equal(f.start({ pattern: 'lead', roles: ['Lead', 'Front', 'Back'], output: 'docs/done.md' }), undefined);
+  const brief = f.prompts[0].text;
+  assert.match(brief, /Don't push or switch branches, and nobody commits during the rounds: at the very end of the last round the Lead commits everything, signed/);
+  f.settle();
+  f.take(0, '## Front\n\n## Back\n');
+  const part = f.prompts.find((p) => p.text.includes('do your part'))!.text;
+  assert.match(part, /don't commit/);
+  f.take(1);
+  f.take(2);
+  const merge = f.prompts.at(-1)!.text;
+  assert.match(merge, /merging the work. Read the team's reports/);
+  assert.doesNotMatch(merge, /Don't commit/);
+  assert.ok(merge.includes(`Last, commit everything in the worktree (${path.join(f.cwd(), 'docs/done.md')} included, but nothing in ${path.join(f.cwd(), '.meeting')}/) as one signed commit (git commit -S), check its signature with git verify-commit HEAD, and say the commit's hash in your reply. Don't push.`));
+  // The lead does as it's told: the output and the team's work in one signed commit, the notes left out.
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: f.cwd(), encoding: 'utf8' }).trim();
+  mkdirSync(path.join(f.cwd(), 'docs'), { recursive: true });
+  writeFileSync(path.join(f.cwd(), 'docs/done.md'), '# Done\n');
+  writeFileSync(path.join(f.cwd(), 'app.ts'), 'export {};\n');
+  git('add', '-A');
+  git('commit', '-q', '-S', '-m', 'The work');
+  git('verify-commit', 'HEAD');
+  const sha = git('rev-parse', '--short', 'HEAD');
+  f.take(0, '', true);
+  for (let i = 0; i < 50 && !f.room.state().current!.commit; i++) await new Promise((r) => setTimeout(r, 20));
+  const m = f.room.state().current!;
+  assert.equal(m.status, 'done');
+  assert.equal(m.commit, sha);
+  assert.equal(git('rev-parse', '--short', 'HEAD'), sha, 'the office adds no commit of its own');
+});
+
+test('when signing refuses the office\u2019s commit, the meeting says so', async (t) => {
+  const f = fixture({ git: true, signing: false }); t.after(() => f.close());
+  assert.equal(f.start({ rounds: 2, output: 'docs/decision.md', title: 'Pick a cache' }), undefined);
+  for (const i of [0, 1, 2]) f.take(i);
+  f.take(0, '# Redis\n');
+  for (let i = 0; i < 100 && !f.room.state().current!.commitError; i++) await new Promise((r) => setTimeout(r, 20));
+  const m = f.room.state().current!;
+  assert.equal(m.commit, undefined);
+  assert.ok(m.commitError);
+  assert.match(f.toasts.at(-1)!, /^Couldn't commit docs\/decision\.md on office\/meeting-pick-a-cache-/);
+  assert.match(meetingSummary(m), /✅ docs\/decision\.md · couldn't commit it: /);
 });
 
 test('only the real meeting patterns pass, not what every object inherits', () => {

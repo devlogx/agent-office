@@ -464,13 +464,17 @@ export class MeetingRoom {
         },
       );
     } else if (m.worktree) {
-      void commitAll(cwd, `${m.title}\n\n${p.label} meeting in Agent Office, called by ${m.calledBy}. Output: ${m.output}`, m.notes).then(
+      // A Lead & team meeting's lead commits, signed, in the last round; the office signs and commits
+      // whatever is left after it (all of the output, in the other patterns). A commit that fails, a
+      // signing hook or key refusing it, says so in the meeting window, not only in a passing toast.
+      void commitAll(cwd, `${m.title}\n\n${p.label} meeting in Agent Office, called by ${m.calledBy}. Output: ${m.output}`, m.notes, m.worktree.base).then(
         (sha) => {
           m.commit = sha;
           this.changed();
         },
         (err) => {
-          this.events.toast(`Couldn't commit ${m.output} on ${m.worktree!.branch}: ${gitError(err)}`, 'warn');
+          m.commitError = gitError(err);
+          this.events.toast(`Couldn't commit ${m.output} on ${m.worktree!.branch}: ${m.commitError}`, 'warn');
           this.changed();
         },
       );
@@ -577,7 +581,7 @@ export class MeetingRoom {
       ? `You're in ${repo ? `${repo}'s` : "the project's"} folder, which other people use too: don't commit, push or switch branches.`
       : m.pattern === 'review'
         ? `This is a review: don't change, commit or push anything in the checkout${repo ? ` of ${repo}` : ''}. The only files you write are your notes${i === 0 ? ` and ${m.output}` : ''}.`
-        : `You all share one git worktree${repo ? ` of ${repo}` : ''}, on the branch ${m.worktree.branch}. Don't commit, push or switch branches: when the meeting is over, the office commits ${m.output}, with whatever else was changed, there.`;
+        : `You all share one git worktree${repo ? ` of ${repo}` : ''}, on the branch ${m.worktree.branch}. Don't push or switch branches, and nobody commits during the rounds: ${m.pattern === 'lead' ? `at the very end of the last round the ${head} commits everything, signed, as its part says, and when the meeting is over the office commits whatever is still uncommitted` : `when the meeting is over, the office commits ${m.output}, with whatever else was changed, signed`}, there.`;
     // The worktree sits inside the floor's own folder, where a search can wander off to.
     const inside = m.worktree ? ` The whole ${repo ? `of ${repo}` : 'project'} is checked out in your working directory: read and write files there, by paths inside it, and never in a folder above it.` : '';
     return this.say('meeting.brief', {
@@ -644,7 +648,7 @@ export class MeetingRoom {
         if (round === 2) {
           return team.map((i) => ({ seat: i, doing: 'doing their part', file: note(2, i), ask: this.say('meeting.lead.part', { plan: A(plan), role: m.seats[i].role, lead: m.seats[0].role, file: A(note(2, i)) }) }));
         }
-        return [{ seat: 0, doing: 'merging the work', file: m.output, ask: this.say('meeting.lead.merge', { reports: notes(2, team), output: A(m.output) }) }];
+        return [{ seat: 0, doing: 'merging the work', file: m.output, ask: this.say('meeting.lead.merge', { reports: notes(2, team), output: A(m.output), notes: A(m.notes) }) }];
       }
       case 'mapreduce': {
         if (step > 1) return null;
@@ -810,14 +814,19 @@ export class MeetingRoom {
 }
 
 /**
- * Commits everything in a checkout but `leaveOut` (the notes); resolves to the commit's short hash, or
- * undefined when there was nothing to commit.
+ * Commits everything in a checkout but `leaveOut` (the notes), signed; resolves to the commit's short
+ * hash. With nothing left to commit, that's the branch's own last commit when it has one since `base`
+ * (the lead's), else undefined. Rejects when git won't commit, a signing key or hook refusing it.
  */
-async function commitAll(cwd: string, message: string, leaveOut: string): Promise<string | undefined> {
+async function commitAll(cwd: string, message: string, leaveOut: string, base: string): Promise<string | undefined> {
   const git = async (args: string[]) => (await execFileP('git', args, { cwd, encoding: 'utf8', timeout: 60_000 })).stdout.trim();
-  await git(['add', '-A', '--', '.', `:(exclude)${leaveOut}`]);
-  if (!(await git(['diff', '--cached', '--name-only']))) return undefined;
-  await git(['commit', '-q', '-m', message]);
+  // Added, then taken back out: naming the notes in the add fails when a gitignore (a global one too) has them.
+  await git(['add', '-A']);
+  await git(['reset', '-q', '--', leaveOut]);
+  if (!(await git(['diff', '--cached', '--name-only']))) {
+    return (await git(['rev-list', '--count', `${base}..HEAD`])) !== '0' ? git(['rev-parse', '--short', 'HEAD']) : undefined;
+  }
+  await git(['commit', '-q', '-S', '-m', message]);
   return git(['rev-parse', '--short', 'HEAD']);
 }
 

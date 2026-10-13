@@ -304,9 +304,9 @@ const DEFS = {
     group: 'meetings',
     label: 'Lead & team · merge',
     used: 'Round 3 of Lead & team, for the lead.',
-    vars: { reports: "The team's reports", output: OUTPUT_NOTE },
+    vars: { reports: "The team's reports", output: OUTPUT_NOTE, notes: 'The notes folder, which stays out of the commit' },
     needs: ['output'],
-    text: `Read the team's reports ({{reports}}) and look at their changes (git status, git diff). Fix whatever doesn't fit together and check that it works (build it, run the tests). Then write {{output}}: what was done, by whom, and how it was checked. ${OUTPUT} Don't commit.`,
+    text: `Read the team's reports ({{reports}}) and look at their changes (git status, git diff). Fix whatever doesn't fit together and check that it works (build it, run the tests). Then write {{output}}: what was done, by whom, and how it was checked. ${OUTPUT} Last, commit everything in the worktree ({{output}} included, but nothing in {{notes}}/) as one signed commit (git commit -S), check its signature with git verify-commit HEAD, and say the commit's hash in your reply. Don't push.`,
   },
   'meeting.mapreduce.map': {
     group: 'meetings',

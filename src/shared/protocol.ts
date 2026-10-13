@@ -515,6 +515,8 @@ export interface Meeting {
   notes: string;
   /** The commit on the meeting's branch that holds the output. */
   commit?: string;
+  /** Why the office couldn't commit it (a signing key or hook refusing, say). */
+  commitError?: string;
   /** Review panel: the review the office posted on the pull request, or why it couldn't. */
   review?: { url?: string; error?: string };
   /** The start of the output file as it gets written, for the board in the room. */

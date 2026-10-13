@@ -149,7 +149,7 @@ export function meetingSummary(m: Meeting): string {
   const head = `${p.icon} ${p.label} · ${ran} · ${meetingSpend(m)}`;
   if (m.status === 'stopped') return `${head} · ⛔ ${m.reason ?? 'stopped'}`;
   if (m.status === 'running') return head;
-  const where = m.review?.url ? ' · posted on the PR' : m.review?.error ? ` · couldn't post it: ${m.review.error}` : m.commit ? ` on ${m.worktree?.branch}` : m.worktree ? ` in ${m.worktree.branch}'s worktree` : '';
+  const where = m.review?.url ? ' · posted on the PR' : m.review?.error ? ` · couldn't post it: ${m.review.error}` : m.commitError ? ` · couldn't commit it: ${m.commitError}` : m.commit ? ` on ${m.worktree?.branch}` : m.worktree ? ` in ${m.worktree.branch}'s worktree` : '';
   return `${head} · ✅ ${m.output}${where}`;
 }
 
